@@ -42,12 +42,13 @@ class AbletonService:
 
         logger.info(f"Ableton service initialized with template: {self.template_path}")
 
-    def generate_setlist(self, service_title: str, stem_matches: Dict[str, StemMatch]) -> Optional[Path]:
+    def generate_setlist(self, service_title: str, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> Optional[Path]:
         """Generate an Ableton Live setlist from stem matches.
 
         Args:
             service_title: Title for the service/setlist
             stem_matches: Dictionary of song titles to stem matches
+            plan_songs: Optional ordered list of PCOSong objects with key information
 
         Returns:
             Path to the generated .als file, or None if failed
@@ -66,7 +67,7 @@ class AbletonService:
             self._convert_version(template_tree)
 
             # Modify the template with service data
-            self._populate_setlist(template_tree, service_title, stem_matches)
+            self._populate_setlist(template_tree, service_title, stem_matches, plan_songs)
 
             # Save the new project file
             output_path = self._generate_output_path(service_title)
@@ -152,7 +153,7 @@ class AbletonService:
             if root.get('Creator'):
                 root.set('Creator', 'Ableton Live 11.3.43')
 
-    def _populate_setlist(self, tree: ET.ElementTree, service_title: str, stem_matches: Dict[str, StemMatch]) -> None:
+    def _populate_setlist(self, tree: ET.ElementTree, service_title: str, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
         """Populate the template with service data - title and song markers."""
         root = tree.getroot()
 
@@ -167,10 +168,10 @@ class AbletonService:
         logger.info(f"Set project title to: {service_title}")
 
         # Replace existing placeholder markers with actual song titles
-        self._populate_existing_markers(liveset, stem_matches)
+        self._populate_existing_markers(liveset, stem_matches, plan_songs)
 
-    def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch]) -> None:
-        """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles."""
+    def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
+        """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles and keys."""
         # Find the Locators element
         locators = liveset.find("Locators")
         if locators is None:
@@ -186,12 +187,23 @@ class AbletonService:
         existing_locators = locators_list.findall("Locator")
         logger.info(f"Found {len(existing_locators)} total markers in template")
 
-        # Get sorted song titles
-        sorted_songs = sorted(stem_matches.keys())
-        logger.info(f"Have {len(sorted_songs)} songs to assign to markers")
+        # Get songs in API order if available (from plan_songs), otherwise use sorted stems
+        songs_with_keys = []
+        if plan_songs:
+            # Use the ordered songs from the plan
+            for song in plan_songs:
+                if song.title in stem_matches:
+                    key_suffix = f" ({song.key_name})" if song.key_name else ""
+                    songs_with_keys.append((song.title, key_suffix))
+            logger.info(f"Using {len(songs_with_keys)} songs in API order")
+        else:
+            # Fallback to alphabetically sorted stems
+            sorted_songs = sorted(stem_matches.keys())
+            songs_with_keys = [(title, "") for title in sorted_songs]
+            logger.info(f"Using {len(songs_with_keys)} songs in alphabetical order (no plan_songs provided)")
 
-        # Create mapping of placeholder names (1), 2), 3), 4)) to song titles
-        placeholder_map = {str(i+1) + ")": sorted_songs[i] for i in range(min(len(sorted_songs), 4))}
+        # Create mapping of placeholder names (1), 2), 3), 4)) to song titles with keys
+        placeholder_map = {str(i+1) + ")": songs_with_keys[i] for i in range(min(len(songs_with_keys), 4))}
         logger.debug(f"Placeholder mapping: {placeholder_map}")
 
         # Replace only the placeholder markers with actual song titles
@@ -201,7 +213,8 @@ class AbletonService:
                 old_name = name_elem.get('Value', '')
                 # Check if this is a placeholder marker
                 if old_name in placeholder_map:
-                    new_name = placeholder_map[old_name]
+                    song_title, key_suffix = placeholder_map[old_name]
+                    new_name = f"{old_name} {song_title}{key_suffix}"
                     name_elem.set('Value', new_name)
                     logger.info(f"Replaced placeholder '{old_name}' with '{new_name}'")
                 else:

@@ -416,7 +416,8 @@ class ProjectFEBApp:
         try:
             output_path = self.ableton_service.generate_setlist(
                 self.selected_plan.title,
-                self.stem_matches
+                self.stem_matches,
+                self.selected_plan.songs
             )
 
             if output_path:

@@ -17,6 +17,7 @@ class PCOSong:
     author: Optional[str] = None
     ccli_number: Optional[str] = None
     themes: List[str] = None
+    key_name: Optional[str] = None
 
     def __post_init__(self):
         if self.themes is None:
@@ -365,7 +366,7 @@ class PlanningCenterService:
         return None
 
     def _get_songs_from_plan(self, plan_id: str) -> List[PCOSong]:
-        """Get songs from a service plan."""
+        """Get songs from a service plan, preserving order and key information."""
         url = f"{self.base_url}/services/v2/plans/{plan_id}/items"
         songs = []
 
@@ -387,6 +388,8 @@ class PlanningCenterService:
                 if song_data:
                     song = self._get_song_details(song_data['id'])
                     if song:
+                        # Capture the key_name from the item (not the song details)
+                        song.key_name = attributes.get('key_name')
                         songs.append(song)
 
         except Exception as e:
