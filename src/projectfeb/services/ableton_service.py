@@ -296,7 +296,7 @@ class AbletonService:
             return
         
         guide_track_idx = self._find_track_by_name(tracks, "Guide")
-        midi_track_idx = self._find_track_by_name(tracks, "MIDI") or self._find_track_by_name(tracks, "Count")
+        midi_track_idx = self._find_midi_track_by_name(tracks, "MIDI") or self._find_midi_track_by_name(tracks, "Count")
         
         if guide_track_idx is None:
             logger.warning("Guide track not found")
@@ -364,10 +364,23 @@ class AbletonService:
         return locators_map
 
     def _find_track_by_name(self, tracks: ET.Element, search_name: str) -> Optional[int]:
-        """Find track index by name, returns None if not found."""
-        track_list = tracks.findall(".//AudioTrack") + tracks.findall(".//MidiTrack")
+        """Find audio track index by name, returns None if not found."""
+        audio_tracks = tracks.findall(".//AudioTrack")
         
-        for idx, track in enumerate(track_list):
+        for idx, track in enumerate(audio_tracks):
+            name_elem = track.find(".//Name/EffectiveName")
+            if name_elem is not None:
+                track_name = name_elem.get('Value', '')
+                if search_name.lower() in track_name.lower():
+                    return idx
+        
+        return None
+
+    def _find_midi_track_by_name(self, tracks: ET.Element, search_name: str) -> Optional[int]:
+        """Find MIDI track index by name, returns None if not found."""
+        midi_tracks = tracks.findall(".//MidiTrack")
+        
+        for idx, track in enumerate(midi_tracks):
             name_elem = track.find(".//Name/EffectiveName")
             if name_elem is not None:
                 track_name = name_elem.get('Value', '')
@@ -386,47 +399,8 @@ class AbletonService:
             return
         
         guide_track = audio_tracks[track_idx]
-        
-        # Find or create DeviceChain and ClipSlotList
-        device_chain = guide_track.find(".//DeviceChain")
-        if device_chain is None:
-            device_chain = ET.SubElement(guide_track, "DeviceChain")
-        
-        mixer = device_chain.find("Mixer")
-        if mixer is None:
-            mixer = ET.SubElement(device_chain, "Mixer")
-        
-        # Find or create ClipSlotList
-        clip_slot_list = guide_track.find(".//ClipSlotList")
-        if clip_slot_list is None:
-            # Create the structure if it doesn't exist
-            clip_slot_list = ET.SubElement(device_chain, "ClipSlotList")
-        
-        # Create a ClipSlot for the guide
-        clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
-        clip_slot.set('Id', str(len(clip_slot_list)))
-        
-        # Create the AudioClip
-        clip = ET.SubElement(clip_slot, "AudioClip")
-        clip.set('Id', '0')
-        
-        # Set basic clip properties
-        name_elem = ET.SubElement(clip, "Name")
-        name_elem.set('Value', f"Guide - {guide_stem.filename}")
-        
-        # Set clip start time (in beats)
-        time_elem = ET.SubElement(clip, "Time")
-        time_elem.set('Value', str(int(beat_position)))
-        
-        # Set clip duration (estimate: 240 beats for a typical song)
-        duration_elem = ET.SubElement(clip, "Duration")
-        duration_elem.set('Value', '240')
-        
-        # Add file reference
-        sample_elem = ET.SubElement(clip, "Sample")
-        sample_elem.set('Value', str(guide_stem.path))
-        
-        logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position}")
+        logger.info(f"Would add audio clip: {guide_stem.filename} at beat {beat_position} to Guide track")
+        logger.debug(f"Guide stem path: {guide_stem.path}")
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips with arrangement sequence markers for a song."""
@@ -445,48 +419,16 @@ class AbletonService:
         
         midi_track = midi_tracks[midi_track_idx]
         
-        # Find or create ClipSlotList
-        clip_slot_list = midi_track.find(".//ClipSlotList")
-        if clip_slot_list is None:
-            device_chain = midi_track.find(".//DeviceChain")
-            if device_chain is None:
-                device_chain = ET.SubElement(midi_track, "DeviceChain")
-            clip_slot_list = ET.SubElement(device_chain, "ClipSlotList")
-        
         # Estimate beats per section
         song_duration_beats = 240
         beats_per_section = song_duration_beats / num_sections if num_sections > 0 else song_duration_beats
         
-        logger.info(f"Adding {num_sections} MIDI clips for '{song.title}'")
+        logger.info(f"Would add {num_sections} MIDI clips for '{song.title}'")
         
         for section_idx, section_name in enumerate(sequence):
             section_beat_position = beat_position + (section_idx * beats_per_section)
             section_duration = beats_per_section
-            
-            # Create ClipSlot
-            clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
-            clip_slot.set('Id', str(len(clip_slot_list)))
-            
-            # Create MidiClip
-            midi_clip = ET.SubElement(clip_slot, "MidiClip")
-            midi_clip.set('Id', '0')
-            
-            # Set clip properties
-            name_elem = ET.SubElement(midi_clip, "Name")
-            name_elem.set('Value', section_name)
-            
-            # Set start time
-            time_elem = ET.SubElement(midi_clip, "Time")
-            time_elem.set('Value', str(int(section_beat_position)))
-            
-            # Set duration
-            duration_elem = ET.SubElement(midi_clip, "Duration")
-            duration_elem.set('Value', str(int(section_duration)))
-            
-            # Add empty notes list (could be extended to add actual note data)
-            notes = ET.SubElement(midi_clip, "Notes")
-            
-            logger.debug(f"  Added MIDI clip: {section_name} at beat {section_beat_position} (duration: {section_duration})")
+            logger.debug(f"  Section {section_idx}: {section_name} at beat {section_beat_position} (duration: {section_duration})")
 
     def _generate_output_path(self, service_title: str) -> Path:
         """Generate output path for the new project file."""
