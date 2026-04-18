@@ -412,7 +412,7 @@ class AbletonService:
         
         # Set basic clip properties
         name_elem = ET.SubElement(clip, "Name")
-        name_elem.set('Value', f"Guide - {Path(guide_stem.file_path).stem}")
+        name_elem.set('Value', f"Guide - {guide_stem.filename}")
         
         # Set clip start time (in beats)
         time_elem = ET.SubElement(clip, "Time")
@@ -424,9 +424,9 @@ class AbletonService:
         
         # Add file reference
         sample_elem = ET.SubElement(clip, "Sample")
-        sample_elem.set('Value', str(guide_stem.file_path))
+        sample_elem.set('Value', str(guide_stem.path))
         
-        logger.info(f"Added audio clip: {Path(guide_stem.file_path).stem} at beat {beat_position}")
+        logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position}")
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips with arrangement sequence markers for a song."""
