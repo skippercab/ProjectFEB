@@ -184,25 +184,30 @@ class AbletonService:
 
         # Get all existing locator elements
         existing_locators = locators_list.findall("Locator")
-        logger.info(f"Found {len(existing_locators)} placeholder markers in template")
+        logger.info(f"Found {len(existing_locators)} total markers in template")
 
         # Get sorted song titles
         sorted_songs = sorted(stem_matches.keys())
         logger.info(f"Have {len(sorted_songs)} songs to assign to markers")
 
-        # Replace each placeholder marker with actual song title
-        for i, locator in enumerate(existing_locators):
-            if i < len(sorted_songs):
-                song_title = sorted_songs[i]
-                name_elem = locator.find("Name")
-                if name_elem is not None:
-                    old_name = name_elem.get('Value', '')
-                    name_elem.set('Value', song_title)
-                    logger.info(f"Marker {i}: Replaced '{old_name}' with '{song_title}'")
+        # Create mapping of placeholder names (1), 2), 3), 4)) to song titles
+        placeholder_map = {str(i+1) + ")": sorted_songs[i] for i in range(min(len(sorted_songs), 4))}
+        logger.debug(f"Placeholder mapping: {placeholder_map}")
+
+        # Replace only the placeholder markers with actual song titles
+        for locator in existing_locators:
+            name_elem = locator.find("Name")
+            if name_elem is not None:
+                old_name = name_elem.get('Value', '')
+                # Check if this is a placeholder marker
+                if old_name in placeholder_map:
+                    new_name = placeholder_map[old_name]
+                    name_elem.set('Value', new_name)
+                    logger.info(f"Replaced placeholder '{old_name}' with '{new_name}'")
                 else:
-                    logger.warning(f"Marker {i}: No Name element found")
+                    logger.debug(f"Marker '{old_name}' is not a placeholder, leaving unchanged")
             else:
-                logger.warning(f"More markers than songs: marker {i} has no song to assign")
+                logger.warning(f"Locator has no Name element")
 
     def _set_project_title(self, liveset: ET.Element, title: str) -> None:
         """Set the project title in the LiveSet."""
