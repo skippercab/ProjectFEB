@@ -538,6 +538,15 @@ class ProjectFEBApp:
         settings_window = SettingsDialog(self.root, self.config)
         self.root.wait_window(settings_window.dialog)
         
+        # Reload config from file and reinitialize services
+        config_path = Path(__file__).parent.parent.parent.parent / "config" / "settings.json"
+        self.config = Config(config_path)
+        
+        # Reinitialize services with updated config
+        self.pco_service = PlanningCenterService(self.config.planning_center)
+        self.multitracks_service = MultitracksService(self.config.multitracks)
+        self.ableton_service = AbletonService(self.config.ableton)
+        
         # Reload folders after settings are potentially changed
         self._load_folders()
 
