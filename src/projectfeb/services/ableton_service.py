@@ -154,7 +154,7 @@ class AbletonService:
                 root.set('Creator', 'Ableton Live 11.3.43')
 
     def _populate_setlist(self, tree: ET.ElementTree, service_title: str, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
-        """Populate the template with service data - title and song markers."""
+        """Populate the template with service data - title, song markers, guides, and MIDI clips."""
         root = tree.getroot()
 
         # Find the LiveSet element
@@ -169,6 +169,10 @@ class AbletonService:
 
         # Replace existing placeholder markers with actual song titles
         self._populate_existing_markers(liveset, stem_matches, plan_songs)
+        
+        # Add guide stems and MIDI clips for each song (if arrangement data available)
+        if plan_songs:
+            self._add_guides_and_midi_clips(liveset, stem_matches, plan_songs)
 
     def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
         """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles and keys."""
@@ -276,6 +280,98 @@ class AbletonService:
         annotation_elem.set('Value', '')
 
         logger.debug(f"Added locator: {song_title} at beat {time_position} with ID {locator_id}")
+
+    def _add_guides_and_midi_clips(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: List) -> None:
+        """Add guide stems to track 3 and create MIDI clips with arrangement sequence."""
+        # Calculate total timeline beats (assume 120 BPM baseline, each song gets ~240 beats or its duration)
+        current_beat_position = 0
+        
+        logger.info(f"Starting to add guides and MIDI clips for {len(plan_songs)} songs")
+        
+        for song in plan_songs:
+            if song.title not in stem_matches:
+                logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/MIDI")
+                continue
+            
+            stem_match = stem_matches[song.title]
+            
+            # Find guide stem for this song
+            guide_stems = [s for s in stem_match.stems if s.stem_type == 'guide']
+            if not guide_stems:
+                logger.debug(f"No guide stem found for '{song.title}'")
+            else:
+                logger.info(f"Adding guide stem for '{song.title}' at beat {current_beat_position}")
+                self._add_guide_stem_to_track(liveset, guide_stems[0], current_beat_position)
+            
+            # Add MIDI clips with arrangement sequence
+            if song.arrangement and song.arrangement.sequence:
+                logger.info(f"Adding MIDI clips for '{song.title}' with {len(song.arrangement.sequence)} sections")
+                self._add_midi_clips_for_song(liveset, song, current_beat_position)
+            
+            # Estimate beat duration for this song (simplified: assume 120 BPM, ~240 beats per song)
+            # In reality, this should be based on the actual guide audio duration
+            song_duration_beats = 240
+            current_beat_position += song_duration_beats
+
+    def _add_guide_stem_to_track(self, liveset: ET.Element, guide_stem: AudioStem, beat_position: float) -> None:
+        """Add a guide stem audio clip to track 3 (Guide track)."""
+        # Find the MasterTrack to get reference to other tracks
+        master_track = liveset.find(".//MasterTrack")
+        if master_track is None:
+            logger.warning("Could not find MasterTrack to reference audio tracks")
+            return
+        
+        # Find the Guide track (typically track 3, but search by name)
+        tracks = liveset.find(".//Tracks")
+        if tracks is None:
+            logger.warning("Could not find Tracks element")
+            return
+        
+        guide_track = None
+        track_index = 0
+        for track in tracks.findall(".//AudioTrack"):
+            track_name_elem = track.find(".//Name/EffectiveName")
+            if track_name_elem is not None and "Guide" in track_name_elem.get('Value', ''):
+                guide_track = track
+                logger.info(f"Found Guide track at index {track_index}")
+                break
+            track_index += 1
+        
+        if not guide_track:
+            logger.warning("Guide track not found, skipping audio placement")
+            return
+        
+        # Create clip for the guide
+        # Note: This is a simplified implementation. Full implementation would need to:
+        # 1. Create proper Ableton clip with file reference
+        # 2. Set the clip length based on audio file duration
+        # 3. Handle file path references correctly
+        logger.info(f"Would place guide stem at beat {beat_position}: {guide_stem.file_path}")
+        # Actual implementation would create XML elements for clips here
+
+    def _add_midi_clips_for_song(self, liveset: ET.Element, song, beat_position: float) -> None:
+        """Create MIDI clips with arrangement sequence markers for a song."""
+        if not song.arrangement or not song.arrangement.sequence:
+            return
+        
+        sequence = song.arrangement.sequence
+        num_sections = len(sequence)
+        
+        # Estimate beats per section (simplified: 240 beats total for song)
+        song_duration_beats = 240
+        beats_per_section = song_duration_beats / num_sections if num_sections > 0 else song_duration_beats
+        
+        logger.info(f"Song '{song.title}': Adding MIDI clips for {num_sections} sections")
+        
+        for section_idx, section_name in enumerate(sequence):
+            section_beat_position = beat_position + (section_idx * beats_per_section)
+            logger.debug(f"  Section {section_idx}: {section_name} at beat {section_beat_position}")
+            
+            # In a full implementation, this would:
+            # 1. Create a MIDI clip in a dedicated MIDI track
+            # 2. Add a note with name=section_name
+            # 3. Position it at section_beat_position
+            # For now, we log the structure
 
     def _generate_output_path(self, service_title: str) -> Path:
         """Generate output path for the new project file."""

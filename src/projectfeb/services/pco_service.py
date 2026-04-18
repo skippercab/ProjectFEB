@@ -10,6 +10,14 @@ from loguru import logger
 from ..core.config import PlanningCenterConfig
 
 @dataclass
+class PCOArrangement:
+    """Represents an arrangement from Planning Center Online."""
+    id: str
+    sequence: List[str]
+    bpm: int
+    meter: str
+
+@dataclass
 class PCOSong:
     """Represents a song from Planning Center Online."""
     id: str
@@ -18,6 +26,8 @@ class PCOSong:
     ccli_number: Optional[str] = None
     themes: List[str] = None
     key_name: Optional[str] = None
+    item_id: Optional[str] = None
+    arrangement: Optional[PCOArrangement] = None
 
     def __post_init__(self):
         if self.themes is None:
@@ -312,7 +322,8 @@ class PlanningCenterService:
                 return None
 
             # Get songs from plan items
-            songs = self._get_songs_from_plan(plan_data['id'])
+            service_type_id = relationships.get('service_type', {}).get('data', {}).get('id')
+            songs = self._get_songs_from_plan(plan_data['id'], service_type_id)
 
             plan = PCOServicePlan(
                 id=plan_data['id'],
@@ -365,8 +376,8 @@ class PlanningCenterService:
         logger.debug(f"Could not parse date with any format: {date_str}")
         return None
 
-    def _get_songs_from_plan(self, plan_id: str) -> List[PCOSong]:
-        """Get songs from a service plan, preserving order and key information."""
+    def _get_songs_from_plan(self, plan_id: str, service_type_id: Optional[str] = None) -> List[PCOSong]:
+        """Get songs from a service plan, preserving order, key information, and arrangement sequence."""
         url = f"{self.base_url}/services/v2/plans/{plan_id}/items"
         songs = []
 
@@ -390,6 +401,12 @@ class PlanningCenterService:
                     if song:
                         # Capture the key_name from the item (not the song details)
                         song.key_name = attributes.get('key_name')
+                        song.item_id = item['id']
+                        
+                        # Fetch arrangement if service_type_id is available
+                        if service_type_id:
+                            song.arrangement = self._get_arrangement_for_item(service_type_id, plan_id, item['id'])
+                        
                         songs.append(song)
 
         except Exception as e:
@@ -420,4 +437,26 @@ class PlanningCenterService:
 
         except Exception as e:
             logger.error(f"Failed to get song details for {song_id}: {e}")
+            return None
+
+    def _get_arrangement_for_item(self, service_type_id: str, plan_id: str, item_id: str) -> Optional[PCOArrangement]:
+        """Get arrangement data for a service plan item."""
+        url = f"{self.base_url}/services/v2/service_types/{service_type_id}/plans/{plan_id}/items/{item_id}/arrangement"
+
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            attributes = data.get('data', {}).get('attributes', {})
+            arrangement = PCOArrangement(
+                id=data.get('data', {}).get('id', ''),
+                sequence=attributes.get('sequence', []),
+                bpm=attributes.get('bpm', 120),
+                meter=attributes.get('meter', '4/4')
+            )
+            return arrangement
+
+        except Exception as e:
+            logger.error(f"Failed to get arrangement for item {item_id}: {e}")
             return None
