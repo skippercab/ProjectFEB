@@ -7,6 +7,7 @@ from typing import Optional, Dict
 from loguru import logger
 import time
 import json
+from dataclasses import asdict
 
 from ..core.config import Config
 from ..services.pco_service import (
@@ -534,8 +535,305 @@ class ProjectFEBApp:
 
     def _open_settings(self):
         """Open the settings dialog."""
-        # For now, just show a placeholder
-        messagebox.showinfo("Settings", "Settings dialog coming soon!\n\nFor now, edit config/settings.json manually.")
+        settings_window = SettingsDialog(self.root, self.config)
+        self.root.wait_window(settings_window.dialog)
+        
+        # Reload folders after settings are potentially changed
+        self._load_folders()
+
+
+class SettingsDialog:
+    """Settings dialog for configuring the application."""
+    
+    def __init__(self, parent, config: Config):
+        """Initialize settings dialog.
+        
+        Args:
+            parent: Parent window
+            config: Application configuration to edit
+        """
+        self.config = config
+        self.config_path = Path(__file__).parent.parent.parent.parent / "config" / "settings.json"
+        
+        # Create dialog window
+        self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.title("Settings")
+        self.dialog.geometry("700x750")
+        self.dialog.resizable(True, True)
+        
+        # Make it modal
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        self._create_widgets()
+    
+    def _create_widgets(self):
+        """Create the settings dialog widgets."""
+        main_frame = ctk.CTkScrollableFrame(self.dialog)
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+        
+        # Title
+        title = ctk.CTkLabel(
+            main_frame,
+            text="Application Settings",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        title.pack(pady=(0, 20))
+        
+        # Planning Center Section
+        pc_frame = self._create_section(main_frame, "Planning Center Online")
+        
+        self.pco_app_id_entry = self._create_text_field(
+            pc_frame,
+            "Application ID:",
+            self.config.planning_center.application_id
+        )
+        
+        self.pco_secret_entry = self._create_text_field(
+            pc_frame,
+            "Secret:",
+            self.config.planning_center.secret,
+            show="*"
+        )
+        
+        # Multitracks Section
+        mt_frame = self._create_section(main_frame, "Multitracks")
+        
+        self.stems_folder_entry = self._create_file_field(
+            mt_frame,
+            "Stems Folder:",
+            self.config.multitracks.stems_folder,
+            is_directory=True
+        )
+        
+        # Ableton Section
+        ab_frame = self._create_section(main_frame, "Ableton Live")
+        
+        self.template_path_entry = self._create_file_field(
+            ab_frame,
+            "Template Path:",
+            self.config.ableton.template_path,
+            is_directory=False
+        )
+        
+        self.output_folder_entry = self._create_file_field(
+            ab_frame,
+            "Output Folder:",
+            self.config.ableton.output_folder,
+            is_directory=True
+        )
+        
+        self.version_entry = self._create_text_field(
+            ab_frame,
+            "Ableton Version:",
+            self.config.ableton.version
+        )
+        
+        # Action buttons
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=(20, 0))
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save Settings",
+            command=self._save_settings,
+            fg_color="green",
+            hover_color="dark green"
+        )
+        save_btn.pack(side="left", padx=(0, 10))
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=self.dialog.destroy
+        )
+        cancel_btn.pack(side="left")
+        
+        test_btn = ctk.CTkButton(
+            button_frame,
+            text="Test Connection",
+            command=self._test_connection
+        )
+        test_btn.pack(side="right")
+    
+    def _create_section(self, parent, title: str) -> ctk.CTkFrame:
+        """Create a settings section with a title."""
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.pack(fill="x", pady=(15, 0))
+        
+        title_label = ctk.CTkLabel(
+            frame,
+            text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#4da6ff"
+        )
+        title_label.pack(anchor="w", pady=(0, 10))
+        
+        content_frame = ctk.CTkFrame(frame)
+        content_frame.pack(fill="x", padx=15)
+        
+        return content_frame
+    
+    def _create_text_field(self, parent, label: str, value: str, show: str = None) -> ctk.CTkEntry:
+        """Create a text input field."""
+        label_widget = ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=11))
+        label_widget.pack(anchor="w", pady=(0, 3))
+        
+        entry = ctk.CTkEntry(parent, show=show)
+        entry.insert(0, value)
+        entry.pack(fill="x", pady=(0, 12))
+        
+        return entry
+    
+    def _create_file_field(self, parent, label: str, value: str, is_directory: bool = False) -> ctk.CTkFrame:
+        """Create a file/folder selection field."""
+        container = ctk.CTkFrame(parent, fg_color="transparent")
+        container.pack(fill="x", pady=(0, 12))
+        
+        label_widget = ctk.CTkLabel(container, text=label, font=ctk.CTkFont(size=11))
+        label_widget.pack(anchor="w", pady=(0, 3))
+        
+        input_frame = ctk.CTkFrame(container)
+        input_frame.pack(fill="x")
+        
+        entry = ctk.CTkEntry(input_frame)
+        entry.insert(0, value)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        
+        browse_btn = ctk.CTkButton(
+            input_frame,
+            text="Browse",
+            width=80,
+            command=lambda: self._browse_path(entry, is_directory)
+        )
+        browse_btn.pack(side="right")
+        
+        return entry
+    
+    def _browse_path(self, entry: ctk.CTkEntry, is_directory: bool):
+        """Open file/folder browser dialog."""
+        if is_directory:
+            path = filedialog.askdirectory(
+                title="Select Folder",
+                initialdir=entry.get() or str(Path.home())
+            )
+        else:
+            path = filedialog.askopenfilename(
+                title="Select File",
+                initialdir=entry.get() or str(Path.home()),
+                filetypes=[("All Files", "*.*"), ("ALS Files", "*.als")]
+            )
+        
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+    
+    def _save_settings(self):
+        """Save settings to configuration file."""
+        try:
+            # Update config objects with new values
+            self.config.planning_center.application_id = self.pco_app_id_entry.get().strip()
+            self.config.planning_center.secret = self.pco_secret_entry.get().strip()
+            self.config.multitracks.stems_folder = self.stems_folder_entry.get().strip()
+            self.config.ableton.template_path = self.template_path_entry.get().strip()
+            self.config.ableton.output_folder = self.output_folder_entry.get().strip()
+            self.config.ableton.version = self.version_entry.get().strip()
+            
+            # Validate required fields
+            if not self.config.planning_center.application_id:
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Planning Center Application ID is required."
+                )
+                return
+            
+            if not self.config.planning_center.secret:
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Planning Center Secret is required."
+                )
+                return
+            
+            if self.config.multitracks.stems_folder and not Path(self.config.multitracks.stems_folder).exists():
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Multitracks stems folder does not exist."
+                )
+                return
+            
+            if self.config.ableton.template_path and not Path(self.config.ableton.template_path).exists():
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Ableton template file does not exist."
+                )
+                return
+            
+            if self.config.ableton.output_folder and not Path(self.config.ableton.output_folder).exists():
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Ableton output folder does not exist."
+                )
+                return
+            
+            # Save to file
+            self.config.save(self.config_path)
+            
+            messagebox.showinfo(
+                "Success",
+                "Settings saved successfully!"
+            )
+            
+            logger.info("Settings saved successfully")
+            self.dialog.destroy()
+            
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}", exc_info=True)
+            messagebox.showerror(
+                "Error",
+                f"Failed to save settings:\n{str(e)}"
+            )
+    
+    def _test_connection(self):
+        """Test Planning Center Online connection."""
+        try:
+            app_id = self.pco_app_id_entry.get().strip()
+            secret = self.pco_secret_entry.get().strip()
+            
+            if not app_id or not secret:
+                messagebox.showwarning(
+                    "Missing Credentials",
+                    "Please enter both Application ID and Secret."
+                )
+                return
+            
+            # Create a temporary service to test connection
+            from ..services.pco_service import PlanningCenterService
+            from ..core.config import PlanningCenterConfig
+            
+            test_config = PlanningCenterConfig(
+                application_id=app_id,
+                secret=secret
+            )
+            test_service = PlanningCenterService(test_config)
+            folders = test_service.get_folders()
+            
+            if folders:
+                messagebox.showinfo(
+                    "Connection Successful",
+                    f"Successfully connected to Planning Center Online!\nFound {len(folders)} folders."
+                )
+            else:
+                messagebox.showwarning(
+                    "No Data",
+                    "Connected successfully but no folders found."
+                )
+            
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}", exc_info=True)
+            messagebox.showerror(
+                "Connection Failed",
+                f"Failed to connect to Planning Center Online:\n{str(e)}"
+            )
 
     def run(self):
         """Run the application main loop."""
