@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Dict
 from loguru import logger
 import time
+import json
 
 from ..core.config import Config
 from ..services.pco_service import (
@@ -38,6 +39,10 @@ class ProjectFEBApp:
         self.selected_service_type: Optional[PCOServiceType] = None
         self.selected_plan: Optional[PCOServicePlan] = None
         self.stem_matches: Dict[str, StemMatch] = {}
+
+        # Preferences file
+        self.preferences_path = Path(__file__).parent.parent.parent.parent / "config" / "preferences.json"
+        self.preferences = self._load_preferences()
 
         # Setup GUI
         ctk.set_appearance_mode("system")
@@ -179,6 +184,26 @@ class ProjectFEBApp:
         """Load initial data when the app starts."""
         self._load_folders()
 
+    def _load_preferences(self) -> Dict:
+        """Load user preferences from file."""
+        if self.preferences_path.exists():
+            try:
+                with open(self.preferences_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load preferences: {e}")
+        return {}
+
+    def _save_preferences(self):
+        """Save user preferences to file."""
+        try:
+            self.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.preferences_path, 'w') as f:
+                json.dump(self.preferences, f, indent=2)
+            logger.debug(f"Preferences saved: {self.preferences}")
+        except Exception as e:
+            logger.error(f"Failed to save preferences: {e}")
+
     def _load_folders(self):
         """Load folders from Planning Center Online."""
         try:
@@ -227,11 +252,21 @@ class ProjectFEBApp:
             self.folder_combo.configure(values=folder_names)
             logger.info(f"Step 5: Set combo box with {len(folder_names)} values")
             
-            # Set to first folder as default
-            if folder_names:
-                self.folder_combo.set(folder_names[0])
-                logger.info(f"Step 6: Set default selection to: {folder_names[0]}")
-                self._on_folder_selected(folder_names[0])
+            # Restore last selected folder if available
+            last_folder_id = self.preferences.get("last_folder_id")
+            default_folder_name = folder_names[0]
+            
+            if last_folder_id:
+                for folder in self.folders:
+                    if folder.id == last_folder_id:
+                        default_folder_name = f"{folder.name} (ID: {folder.id})"
+                        logger.info(f"Restoring last selected folder: {folder.name}")
+                        break
+            
+            if default_folder_name:
+                self.folder_combo.set(default_folder_name)
+                logger.info(f"Step 6: Set default selection to: {default_folder_name}")
+                self._on_folder_selected(default_folder_name)
             
             logger.info("=== COMPLETED _load_folders ===")
 
@@ -254,6 +289,10 @@ class ProjectFEBApp:
                 break
 
         if self.selected_folder:
+            # Save folder preference
+            self.preferences["last_folder_id"] = self.selected_folder.id
+            self._save_preferences()
+            
             self._load_service_types_for_folder()
         else:
             self.service_type_combo.configure(values=[])
@@ -282,9 +321,21 @@ class ProjectFEBApp:
             st_names = [st.name for st in self.service_types]
 
             self.service_type_combo.configure(values=st_names)
-            if st_names:
-                self.service_type_combo.set(st_names[0])
-                self._on_service_type_selected(st_names[0])
+            
+            # Restore last selected service type if available
+            last_service_type_id = self.preferences.get("last_service_type_id")
+            default_service_type = st_names[0] if st_names else None
+            
+            if last_service_type_id:
+                for st in self.service_types:
+                    if st.id == last_service_type_id:
+                        default_service_type = st.name
+                        logger.info(f"Restoring last selected service type: {st.name}")
+                        break
+            
+            if default_service_type:
+                self.service_type_combo.set(default_service_type)
+                self._on_service_type_selected(default_service_type)
 
         except Exception as e:
             logger.error(f"Failed to load service types: {e}")
@@ -304,6 +355,10 @@ class ProjectFEBApp:
                 break
 
         if self.selected_service_type:
+            # Save service type preference
+            self.preferences["last_service_type_id"] = self.selected_service_type.id
+            self._save_preferences()
+            
             self._load_service_plans_for_service_type()
         else:
             self.service_combo.configure(values=[])
