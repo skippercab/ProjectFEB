@@ -283,95 +283,207 @@ class AbletonService:
 
     def _add_guides_and_midi_clips(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: List) -> None:
         """Add guide stems to track 3 and create MIDI clips with arrangement sequence."""
-        # Calculate total timeline beats (assume 120 BPM baseline, each song gets ~240 beats or its duration)
-        current_beat_position = 0
+        # Get locators to find song start positions
+        locators_map = self._get_locators_map(liveset)
         
         logger.info(f"Starting to add guides and MIDI clips for {len(plan_songs)} songs")
+        logger.info(f"Found {len(locators_map)} song markers: {list(locators_map.keys())}")
         
-        for song in plan_songs:
+        # Track index for Guide track (typically 2, but find it)
+        tracks = liveset.find(".//Tracks")
+        if tracks is None:
+            logger.error("No Tracks element found")
+            return
+        
+        guide_track_idx = self._find_track_by_name(tracks, "Guide")
+        midi_track_idx = self._find_track_by_name(tracks, "MIDI") or self._find_track_by_name(tracks, "Count")
+        
+        if guide_track_idx is None:
+            logger.warning("Guide track not found")
+        if midi_track_idx is None:
+            logger.warning("MIDI/Count track not found for arrangement sections")
+        
+        # Process each song
+        for song_idx, song in enumerate(plan_songs):
             if song.title not in stem_matches:
                 logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/MIDI")
                 continue
             
+            # Find the marker name for this song (e.g., "1) The Blood (B)")
+            marker_key = f"{song_idx + 1}) {song.title}"
+            if marker_key not in locators_map:
+                logger.warning(f"Marker '{marker_key}' not found in template")
+                continue
+            
+            song_start_beat = locators_map[marker_key]
+            logger.info(f"Song {song_idx + 1} '{song.title}' starts at beat {song_start_beat}")
+            
             stem_match = stem_matches[song.title]
             
-            # Find guide stem for this song
-            guide_stems = [s for s in stem_match.stems if s.stem_type == 'guide']
-            if not guide_stems:
-                logger.debug(f"No guide stem found for '{song.title}'")
-            else:
-                logger.info(f"Adding guide stem for '{song.title}' at beat {current_beat_position}")
-                self._add_guide_stem_to_track(liveset, guide_stems[0], current_beat_position)
+            # Add guide stem to track 3
+            if guide_track_idx is not None:
+                guide_stems = [s for s in stem_match.stems if s.stem_type == 'guide']
+                if guide_stems:
+                    logger.info(f"Adding guide stem for '{song.title}' at beat {song_start_beat}")
+                    self._add_guide_stem_to_track(tracks, guide_track_idx, guide_stems[0], song_start_beat)
+                else:
+                    logger.debug(f"No guide stem found for '{song.title}'")
             
             # Add MIDI clips with arrangement sequence
-            if song.arrangement and song.arrangement.sequence:
+            if midi_track_idx is not None and song.arrangement and song.arrangement.sequence:
                 logger.info(f"Adding MIDI clips for '{song.title}' with {len(song.arrangement.sequence)} sections")
-                self._add_midi_clips_for_song(liveset, song, current_beat_position)
+                self._add_midi_clips_for_song(tracks, midi_track_idx, song, song_start_beat)
+
+    def _get_locators_map(self, liveset: ET.Element) -> Dict[str, float]:
+        """Extract marker names and their beat positions from locators."""
+        locators_map = {}
+        
+        locators = liveset.find("Locators")
+        if locators is None:
+            return locators_map
+        
+        locators_list = locators.find("Locators")
+        if locators_list is None:
+            return locators_map
+        
+        for locator in locators_list.findall("Locator"):
+            name_elem = locator.find("Name")
+            time_elem = locator.find("Time")
             
-            # Estimate beat duration for this song (simplified: assume 120 BPM, ~240 beats per song)
-            # In reality, this should be based on the actual guide audio duration
-            song_duration_beats = 240
-            current_beat_position += song_duration_beats
+            if name_elem is not None and time_elem is not None:
+                name = name_elem.get('Value', '')
+                try:
+                    beat_pos = float(time_elem.get('Value', 0))
+                    locators_map[name] = beat_pos
+                except ValueError:
+                    pass
+        
+        return locators_map
 
-    def _add_guide_stem_to_track(self, liveset: ET.Element, guide_stem: AudioStem, beat_position: float) -> None:
-        """Add a guide stem audio clip to track 3 (Guide track)."""
-        # Find the MasterTrack to get reference to other tracks
-        master_track = liveset.find(".//MasterTrack")
-        if master_track is None:
-            logger.warning("Could not find MasterTrack to reference audio tracks")
-            return
+    def _find_track_by_name(self, tracks: ET.Element, search_name: str) -> Optional[int]:
+        """Find track index by name, returns None if not found."""
+        track_list = tracks.findall(".//AudioTrack") + tracks.findall(".//MidiTrack")
         
-        # Find the Guide track (typically track 3, but search by name)
-        tracks = liveset.find(".//Tracks")
-        if tracks is None:
-            logger.warning("Could not find Tracks element")
-            return
+        for idx, track in enumerate(track_list):
+            name_elem = track.find(".//Name/EffectiveName")
+            if name_elem is not None:
+                track_name = name_elem.get('Value', '')
+                if search_name.lower() in track_name.lower():
+                    return idx
         
-        guide_track = None
-        track_index = 0
-        for track in tracks.findall(".//AudioTrack"):
-            track_name_elem = track.find(".//Name/EffectiveName")
-            if track_name_elem is not None and "Guide" in track_name_elem.get('Value', ''):
-                guide_track = track
-                logger.info(f"Found Guide track at index {track_index}")
-                break
-            track_index += 1
-        
-        if not guide_track:
-            logger.warning("Guide track not found, skipping audio placement")
-            return
-        
-        # Create clip for the guide
-        # Note: This is a simplified implementation. Full implementation would need to:
-        # 1. Create proper Ableton clip with file reference
-        # 2. Set the clip length based on audio file duration
-        # 3. Handle file path references correctly
-        logger.info(f"Would place guide stem at beat {beat_position}: {guide_stem.file_path}")
-        # Actual implementation would create XML elements for clips here
+        return None
 
-    def _add_midi_clips_for_song(self, liveset: ET.Element, song, beat_position: float) -> None:
+    def _add_guide_stem_to_track(self, tracks: ET.Element, track_idx: int, guide_stem: AudioStem, beat_position: float) -> None:
+        """Add a guide stem audio clip to the Guide track at specified beat position."""
+        # Get all audio tracks
+        audio_tracks = tracks.findall(".//AudioTrack")
+        
+        if track_idx >= len(audio_tracks):
+            logger.warning(f"Track index {track_idx} out of range")
+            return
+        
+        guide_track = audio_tracks[track_idx]
+        
+        # Find or create DeviceChain and ClipSlotList
+        device_chain = guide_track.find(".//DeviceChain")
+        if device_chain is None:
+            device_chain = ET.SubElement(guide_track, "DeviceChain")
+        
+        mixer = device_chain.find("Mixer")
+        if mixer is None:
+            mixer = ET.SubElement(device_chain, "Mixer")
+        
+        # Find or create ClipSlotList
+        clip_slot_list = guide_track.find(".//ClipSlotList")
+        if clip_slot_list is None:
+            # Create the structure if it doesn't exist
+            clip_slot_list = ET.SubElement(device_chain, "ClipSlotList")
+        
+        # Create a ClipSlot for the guide
+        clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
+        clip_slot.set('Id', str(len(clip_slot_list)))
+        
+        # Create the AudioClip
+        clip = ET.SubElement(clip_slot, "AudioClip")
+        clip.set('Id', '0')
+        
+        # Set basic clip properties
+        name_elem = ET.SubElement(clip, "Name")
+        name_elem.set('Value', f"Guide - {Path(guide_stem.file_path).stem}")
+        
+        # Set clip start time (in beats)
+        time_elem = ET.SubElement(clip, "Time")
+        time_elem.set('Value', str(int(beat_position)))
+        
+        # Set clip duration (estimate: 240 beats for a typical song)
+        duration_elem = ET.SubElement(clip, "Duration")
+        duration_elem.set('Value', '240')
+        
+        # Add file reference
+        sample_elem = ET.SubElement(clip, "Sample")
+        sample_elem.set('Value', str(guide_stem.file_path))
+        
+        logger.info(f"Added audio clip: {Path(guide_stem.file_path).stem} at beat {beat_position}")
+
+    def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips with arrangement sequence markers for a song."""
         if not song.arrangement or not song.arrangement.sequence:
+            logger.debug(f"No arrangement sequence for {song.title}")
             return
         
         sequence = song.arrangement.sequence
         num_sections = len(sequence)
         
-        # Estimate beats per section (simplified: 240 beats total for song)
+        # Get MIDI track
+        midi_tracks = tracks.findall(".//MidiTrack")
+        if midi_track_idx >= len(midi_tracks):
+            logger.warning(f"MIDI track index {midi_track_idx} out of range")
+            return
+        
+        midi_track = midi_tracks[midi_track_idx]
+        
+        # Find or create ClipSlotList
+        clip_slot_list = midi_track.find(".//ClipSlotList")
+        if clip_slot_list is None:
+            device_chain = midi_track.find(".//DeviceChain")
+            if device_chain is None:
+                device_chain = ET.SubElement(midi_track, "DeviceChain")
+            clip_slot_list = ET.SubElement(device_chain, "ClipSlotList")
+        
+        # Estimate beats per section
         song_duration_beats = 240
         beats_per_section = song_duration_beats / num_sections if num_sections > 0 else song_duration_beats
         
-        logger.info(f"Song '{song.title}': Adding MIDI clips for {num_sections} sections")
+        logger.info(f"Adding {num_sections} MIDI clips for '{song.title}'")
         
         for section_idx, section_name in enumerate(sequence):
             section_beat_position = beat_position + (section_idx * beats_per_section)
-            logger.debug(f"  Section {section_idx}: {section_name} at beat {section_beat_position}")
+            section_duration = beats_per_section
             
-            # In a full implementation, this would:
-            # 1. Create a MIDI clip in a dedicated MIDI track
-            # 2. Add a note with name=section_name
-            # 3. Position it at section_beat_position
-            # For now, we log the structure
+            # Create ClipSlot
+            clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
+            clip_slot.set('Id', str(len(clip_slot_list)))
+            
+            # Create MidiClip
+            midi_clip = ET.SubElement(clip_slot, "MidiClip")
+            midi_clip.set('Id', '0')
+            
+            # Set clip properties
+            name_elem = ET.SubElement(midi_clip, "Name")
+            name_elem.set('Value', section_name)
+            
+            # Set start time
+            time_elem = ET.SubElement(midi_clip, "Time")
+            time_elem.set('Value', str(int(section_beat_position)))
+            
+            # Set duration
+            duration_elem = ET.SubElement(midi_clip, "Duration")
+            duration_elem.set('Value', str(int(section_duration)))
+            
+            # Add empty notes list (could be extended to add actual note data)
+            notes = ET.SubElement(midi_clip, "Notes")
+            
+            logger.debug(f"  Added MIDI clip: {section_name} at beat {section_beat_position} (duration: {section_duration})")
 
     def _generate_output_path(self, service_title: str) -> Path:
         """Generate output path for the new project file."""
