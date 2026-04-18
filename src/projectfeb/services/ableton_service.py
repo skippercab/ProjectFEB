@@ -352,13 +352,30 @@ class AbletonService:
         return self.output_folder / filename
 
     def _save_project(self, tree: ET.ElementTree, output_path: Path) -> None:
-        """Save the modified project as a proper .als file (ZIP or gzip format)."""
+        """Save the modified project as a proper .als file.
+        
+        For gzip format: Writes XML with proper declaration and compresses.
+        For ZIP format: Extracts, modifies, and re-zips.
+        """
         try:
-            # Convert the modified XML tree to string
-            xml_content = ET.tostring(tree.getroot(), encoding='utf-8')
+            # Convert the modified XML tree to string WITH the XML declaration
+            xml_string = ET.tostring(tree.getroot(), encoding='unicode')
+            
+            # Prepend the XML declaration if not present
+            if not xml_string.startswith('<?xml'):
+                xml_string = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_string
+            
+            # Convert back to bytes
+            xml_content = xml_string.encode('utf-8')
 
-            if self.template_format == 'zip':
-                # Save as ZIP-based .als file
+            if self.template_format == 'gzip':
+                # For gzip: Write XML with proper headers and compression
+                with gzip.GzipFile(output_path, 'wb', compresslevel=9, mtime=0) as f:
+                    f.write(xml_content)
+                logger.debug(f"Saved project as gzip format with XML declaration")
+
+            elif self.template_format == 'zip':
+                # For ZIP: Extract, modify, and re-zip
                 with tempfile.TemporaryDirectory() as temp_dir:
                     temp_dir_path = Path(temp_dir)
 
@@ -398,16 +415,10 @@ class AbletonService:
                                 output_zip.write(file_path, arcname)
                                 logger.debug(f"Added {arcname} to output ZIP")
 
-            elif self.template_format == 'gzip':
-                # Save as gzip-based .als file
-                with gzip.open(output_path, 'wb') as f:
-                    f.write(xml_content)
-                logger.debug(f"Saved project as gzip format")
-
             else:
                 # Default to gzip if format is unknown
                 logger.warning("Template format unknown, defaulting to gzip")
-                with gzip.open(output_path, 'wb') as f:
+                with gzip.GzipFile(output_path, 'wb', compresslevel=9, mtime=0) as f:
                     f.write(xml_content)
 
             logger.info(f"Project saved to: {output_path}")
