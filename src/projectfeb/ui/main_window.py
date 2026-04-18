@@ -331,9 +331,10 @@ class ProjectFEBApp:
                 plan_names.append(display_name)
 
             self.service_combo.configure(values=plan_names)
-            if plan_names:
-                self.service_combo.set(plan_names[0])
-                self._on_service_selected(plan_names[0])
+            # Don't automatically select the first plan - let the user choose
+            # This prevents expensive stem matching until a plan is actually selected
+            self.results_text.delete("0.0", "end")
+            self.results_text.insert("0.0", "Select a service plan from the dropdown above to begin matching stems.")
 
         except Exception as e:
             logger.error(f"Failed to load service plans: {e}")
