@@ -627,12 +627,6 @@ class SettingsDialog:
             is_directory=True
         )
         
-        self.version_entry = self._create_text_field(
-            ab_frame,
-            "Ableton Version:",
-            self.config.ableton.version
-        )
-        
         # Action buttons
         button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         button_frame.pack(fill="x", pady=(20, 0))
@@ -741,7 +735,6 @@ class SettingsDialog:
             self.config.multitracks.stems_folder = self.stems_folder_entry.get().strip()
             self.config.ableton.template_path = self.template_path_entry.get().strip()
             self.config.ableton.output_folder = self.output_folder_entry.get().strip()
-            self.config.ableton.version = self.version_entry.get().strip()
             
             # Validate required fields
             if not self.config.planning_center.application_id:
