@@ -399,8 +399,53 @@ class AbletonService:
             return
         
         guide_track = audio_tracks[track_idx]
-        logger.info(f"Would add audio clip: {guide_stem.filename} at beat {beat_position} to Guide track")
-        logger.debug(f"Guide stem path: {guide_stem.path}")
+        
+        # Find or create ClipSlotsListWrapper
+        clip_slots_wrapper = guide_track.find(".//ClipSlotsListWrapper")
+        if clip_slots_wrapper is None:
+            logger.error("ClipSlotsListWrapper not found in audio track")
+            return
+        
+        # Check if wrapper has children, if not create the structure
+        clip_slot_list = clip_slots_wrapper.find("ClipSlotList")
+        if clip_slot_list is None:
+            clip_slot_list = ET.SubElement(clip_slots_wrapper, "ClipSlotList")
+        
+        # Get the current number of clip slots to determine slot ID
+        existing_slots = clip_slot_list.findall("ClipSlot")
+        slot_id = len(existing_slots)
+        
+        # Create ClipSlot container
+        clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
+        clip_slot.set('Id', str(slot_id))
+        
+        # Create AudioClip element
+        audio_clip = ET.SubElement(clip_slot, "AudioClip")
+        audio_clip.set('Id', '0')
+        audio_clip.set('Time', str(int(beat_position)))
+        
+        # Basic audio clip properties
+        lom_id = ET.SubElement(audio_clip, "LomId")
+        lom_id.set('Value', '0')
+        
+        name_elem = ET.SubElement(audio_clip, "Name")
+        name_elem.set('Value', f"Guide - {guide_stem.filename}")
+        
+        annotation = ET.SubElement(audio_clip, "Annotation")
+        annotation.set('Value', '')
+        
+        color = ET.SubElement(audio_clip, "Color")
+        color.set('Value', '47')  # Blue color
+        
+        # Sample reference
+        sample = ET.SubElement(audio_clip, "Sample")
+        sample.set('Value', str(guide_stem.path))
+        
+        # Sample ref (pointer to file)
+        sample_ref = ET.SubElement(audio_clip, "SampleRef")
+        sample_ref.set('Value', str(guide_stem.path))
+        
+        logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track")
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips with arrangement sequence markers for a song."""
@@ -419,16 +464,223 @@ class AbletonService:
         
         midi_track = midi_tracks[midi_track_idx]
         
+        # Find or create ClipSlotsListWrapper with proper structure
+        clip_slots_wrapper = midi_track.find(".//ClipSlotsListWrapper")
+        if clip_slots_wrapper is None:
+            logger.error("ClipSlotsListWrapper not found in MIDI track")
+            return
+        
+        # Check if wrapper has children, if not create the structure
+        clip_slot_list = clip_slots_wrapper.find("ClipSlotList")
+        if clip_slot_list is None:
+            # Create the container structure
+            clip_slot_list = ET.SubElement(clip_slots_wrapper, "ClipSlotList")
+        
         # Estimate beats per section
         song_duration_beats = 240
         beats_per_section = song_duration_beats / num_sections if num_sections > 0 else song_duration_beats
         
-        logger.info(f"Would add {num_sections} MIDI clips for '{song.title}'")
+        logger.info(f"Adding {num_sections} MIDI clips for '{song.title}'")
+        
+        # Get the current number of clip slots to determine slot ID
+        existing_slots = clip_slot_list.findall("ClipSlot")
+        start_slot_id = len(existing_slots)
         
         for section_idx, section_name in enumerate(sequence):
             section_beat_position = beat_position + (section_idx * beats_per_section)
             section_duration = beats_per_section
-            logger.debug(f"  Section {section_idx}: {section_name} at beat {section_beat_position} (duration: {section_duration})")
+            
+            # Create ClipSlot container
+            clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
+            clip_slot.set('Id', str(start_slot_id + section_idx))
+            
+            # Create the MidiClip with minimal required structure
+            midi_clip = self._create_midi_clip_element(section_name, int(section_beat_position), int(section_duration))
+            clip_slot.append(midi_clip)
+            
+            logger.debug(f"  Added MIDI clip: {section_name} at beat {section_beat_position} (duration: {section_duration})")
+
+    def _create_midi_clip_element(self, name: str, beat_position: int, duration: int) -> ET.Element:
+        """Create a properly structured MidiClip element with all required Ableton attributes."""
+        clip = ET.Element("MidiClip")
+        clip.set('Id', '0')
+        clip.set('Time', str(beat_position))
+        
+        # LomId and LomIdView
+        lom_id = ET.SubElement(clip, "LomId")
+        lom_id.set('Value', '0')
+        lom_id_view = ET.SubElement(clip, "LomIdView")
+        lom_id_view.set('Value', '0')
+        
+        # Current boundaries
+        current_start = ET.SubElement(clip, "CurrentStart")
+        current_start.set('Value', '0')
+        current_end = ET.SubElement(clip, "CurrentEnd")
+        current_end.set('Value', str(duration))
+        
+        # Loop configuration
+        loop = ET.SubElement(clip, "Loop")
+        loop_start = ET.SubElement(loop, "LoopStart")
+        loop_start.set('Value', '0')
+        loop_end = ET.SubElement(loop, "LoopEnd")
+        loop_end.set('Value', str(duration))
+        loop_on = ET.SubElement(loop, "LoopOn")
+        loop_on.set('Value', 'true')
+        out_marker = ET.SubElement(loop, "OutMarker")
+        out_marker.set('Value', str(duration))
+        hidden_loop_start = ET.SubElement(loop, "HiddenLoopStart")
+        hidden_loop_start.set('Value', '0')
+        hidden_loop_end = ET.SubElement(loop, "HiddenLoopEnd")
+        hidden_loop_end.set('Value', str(duration))
+        
+        # Name
+        name_elem = ET.SubElement(clip, "Name")
+        name_elem.set('Value', name)
+        
+        # Annotation
+        annotation = ET.SubElement(clip, "Annotation")
+        annotation.set('Value', '')
+        
+        # Color (17 = orange/yellow for arrangement markers)
+        color = ET.SubElement(clip, "Color")
+        color.set('Value', '17')
+        
+        # Launch settings
+        launch_mode = ET.SubElement(clip, "LaunchMode")
+        launch_mode.set('Value', 'Clip')
+        launch_quantization = ET.SubElement(clip, "LaunchQuantisation")
+        launch_quantization.set('Value', 'Global')
+        
+        # Time Signature (4/4)
+        time_sig = ET.SubElement(clip, "TimeSignature")
+        remote_time_sig = ET.SubElement(time_sig, "RemoteableTimeSignature")
+        numerator = ET.SubElement(remote_time_sig, "Numerator")
+        numerator.set('Value', '4')
+        denominator = ET.SubElement(remote_time_sig, "Denominator")
+        denominator.set('Value', '4')
+        
+        # Envelopes (empty)
+        envelopes = ET.SubElement(clip, "Envelopes")
+        envelopes.set('Envelopes', '')
+        
+        # ScrollerTimePreserver
+        scroller = ET.SubElement(clip, "ScrollerTimePreserver")
+        scroll_time = ET.SubElement(scroller, "Time")
+        scroll_time.set('Value', '0')
+        
+        # TimeSelection
+        time_sel = ET.SubElement(clip, "TimeSelection")
+        time_sel_start = ET.SubElement(time_sel, "StartTime")
+        time_sel_start.set('Value', '0')
+        time_sel_end = ET.SubElement(time_sel, "EndTime")
+        time_sel_end.set('Value', str(duration))
+        
+        # Legato
+        legato = ET.SubElement(clip, "Legato")
+        legato.set('Value', 'false')
+        
+        # Ram
+        ram = ET.SubElement(clip, "Ram")
+        ram.set('Value', 'false')
+        
+        # GrooveSettings
+        groove = ET.SubElement(clip, "GrooveSettings")
+        groove_override = ET.SubElement(groove, "GrooveOverride")
+        groove_override.set('Value', 'false')
+        groove_amount = ET.SubElement(groove, "Amount")
+        groove_amount.set('Value', '1')
+        
+        # Grid
+        grid = ET.SubElement(clip, "Grid")
+        grid_fixed_num = ET.SubElement(grid, "FixedNumerator")
+        grid_fixed_num.set('Value', '4')
+        grid_fixed_denom = ET.SubElement(grid, "FixedDenominator")
+        grid_fixed_denom.set('Value', '4')
+        grid_interval = ET.SubElement(grid, "GridIntervalPixel")
+        grid_interval.set('Value', '20')
+        grid_ntoles = ET.SubElement(grid, "Ntoles")
+        grid_ntoles.set('Value', '1')
+        grid_snap = ET.SubElement(grid, "SnapToGrid")
+        grid_snap.set('Value', 'true')
+        grid_fixed = ET.SubElement(grid, "Fixed")
+        grid_fixed.set('Value', 'false')
+        
+        # Freeze settings
+        freeze_start = ET.SubElement(clip, "FreezeStart")
+        freeze_start.set('Value', '0')
+        freeze_end = ET.SubElement(clip, "FreezeEnd")
+        freeze_end.set('Value', '0')
+        is_warped = ET.SubElement(clip, "IsWarped")
+        is_warped.set('Value', 'false')
+        
+        # Take ID
+        take_id = ET.SubElement(clip, "TakeId")
+        take_id.set('Value', '0')
+        
+        # Notes section (empty but required)
+        notes = ET.SubElement(clip, "Notes")
+        key_tracks = ET.SubElement(notes, "KeyTracks")
+        per_note_store = ET.SubElement(notes, "PerNoteEventStore")
+        event_lists = ET.SubElement(notes, "EventLists")
+        note_id_gen = ET.SubElement(notes, "NoteIdGenerator")
+        note_id_gen.set('Value', '0')
+        
+        # MIDI settings
+        bank_select_coarse = ET.SubElement(clip, "BankSelectCoarse")
+        bank_select_coarse.set('Value', '-1')
+        bank_select_fine = ET.SubElement(clip, "BankSelectFine")
+        bank_select_fine.set('Value', '-1')
+        program_change = ET.SubElement(clip, "ProgramChange")
+        program_change.set('Value', '-1')
+        
+        # Note editor settings
+        note_ed_fold_in_zoom = ET.SubElement(clip, "NoteEditorFoldInZoom")
+        note_ed_fold_in_zoom.set('Value', '-1')
+        note_ed_fold_in_scroll = ET.SubElement(clip, "NoteEditorFoldInScroll")
+        note_ed_fold_in_scroll.set('Value', '-1')
+        note_ed_fold_out_zoom = ET.SubElement(clip, "NoteEditorFoldOutZoom")
+        note_ed_fold_out_zoom.set('Value', '-1')
+        note_ed_fold_out_scroll = ET.SubElement(clip, "NoteEditorFoldOutScroll")
+        note_ed_fold_out_scroll.set('Value', '-1')
+        
+        # Scale information
+        scale_info = ET.SubElement(clip, "ScaleInformation")
+        root_note = ET.SubElement(scale_info, "RootNote")
+        root_note.set('Value', '0')
+        scale_name = ET.SubElement(scale_info, "Name")
+        scale_name.set('Value', 'Major')
+        
+        # In key settings
+        is_in_key = ET.SubElement(clip, "IsInKey")
+        is_in_key.set('Value', 'false')
+        note_spelling_pref = ET.SubElement(clip, "NoteSpellingPreference")
+        note_spelling_pref.set('Value', 'Flats')
+        prefer_flat_root = ET.SubElement(clip, "PreferFlatRootNote")
+        prefer_flat_root.set('Value', 'false')
+        
+        # Follow action (disabled)
+        follow_action = ET.SubElement(clip, "FollowAction")
+        follow_time = ET.SubElement(follow_action, "FollowTime")
+        follow_time.set('Value', '1')
+        is_linked = ET.SubElement(follow_action, "IsLinked")
+        is_linked.set('Value', 'false')
+        loop_iterations = ET.SubElement(follow_action, "LoopIterations")
+        loop_iterations.set('Value', '-1')
+        follow_action_a = ET.SubElement(follow_action, "FollowActionA")
+        follow_action_a.set('Value', 'Stop')
+        follow_action_b = ET.SubElement(follow_action, "FollowActionB")
+        follow_action_b.set('Value', 'Stop')
+        
+        # Expression grid
+        expr_grid = ET.SubElement(clip, "ExpressionGrid")
+        expr_fixed_num = ET.SubElement(expr_grid, "FixedNumerator")
+        expr_fixed_num.set('Value', '4')
+        expr_fixed_denom = ET.SubElement(expr_grid, "FixedDenominator")
+        expr_fixed_denom.set('Value', '4')
+        expr_interval = ET.SubElement(expr_grid, "GridIntervalPixel")
+        expr_interval.set('Value', '20')
+        
+        return clip
 
     def _generate_output_path(self, service_title: str) -> Path:
         """Generate output path for the new project file."""
