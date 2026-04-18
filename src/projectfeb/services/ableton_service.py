@@ -31,6 +31,16 @@ class AbletonTrack:
 class AbletonService:
     """Service for working with Ableton Live project files."""
 
+    STEM_SEND_ROUTING = {
+        'perc': (0, 8),
+        'bass': (5, 8),
+        'leads': (1, 8),
+        'strings': (6, 8),
+        'keys': (2, 8),
+        'vocals': (7, 8),
+        'guide': (4, 8),
+    }
+
     def __init__(self, config: AbletonConfig):
         """Initialize the Ableton service.
 
@@ -349,51 +359,46 @@ class AbletonService:
         plan_songs: List,
         als_file_path: Optional[Path],
     ) -> None:
-        """Add guide stems to existing track, create guide audio tracks for .wav files, and create MIDI clips with arrangement sequence."""
-        # Get locators to find song start positions
+        """Add guide stems, routed audio stem tracks, and MIDI clips for each song."""
         locators_map = self._get_locators_map(liveset)
-        
+
         logger.info(f"Starting to add guides and MIDI clips for {len(plan_songs)} songs")
         logger.info(f"Found {len(locators_map)} song markers: {list(locators_map.keys())}")
-        
-        # Track index for Guide track (typically 2, but find it)
+
         tracks = liveset.find(".//Tracks")
         if tracks is None:
             logger.error("No Tracks element found")
             return
-        
+
         guide_track_idx = self._find_track_by_name(tracks, "Guide")
-        
-        # Create a brand new MIDI track for the arrangement clips at the top
         midi_track_idx = self._create_arrangement_track(tracks)
-        
         shared_guide_audio_track = None
 
         if guide_track_idx is None:
             logger.warning("Guide track not found, will create a shared audio track for guide wavs")
         if midi_track_idx is None:
             logger.warning("Failed to create arrangement track")
-        
-        # Process each song
+
         for song_idx, song in enumerate(plan_songs):
             if song.title not in stem_matches:
                 logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/MIDI")
                 continue
-            
-            # Find the marker name for this song, including key if available (e.g., "1) The Blood (B)")
+
             marker_key = f"{song_idx + 1}) {song.title}"
             if song.key_name:
                 marker_key += f" ({song.key_name})"
-            
+
             if marker_key not in locators_map:
                 logger.warning(f"Marker '{marker_key}' not found in template")
                 continue
-            
+
             song_start_beat = locators_map[marker_key]
             logger.info(f"Song {song_idx + 1} '{song.title}' starts at beat {song_start_beat}")
-            
+
             stem_match = stem_matches[song.title]
-            
+            bpm = song.arrangement.bpm if song.arrangement and song.arrangement.bpm else 120
+            song_color = self._get_song_color_from_click_track(tracks, song_start_beat)
+
             primary_guide_wav = self._select_primary_guide_wav(stem_match.stems)
             if primary_guide_wav and als_file_path is not None:
                 logger.info(f"Adding guide wav for '{song.title}' at beat {song_start_beat}: {primary_guide_wav.filename}")
@@ -401,8 +406,7 @@ class AbletonService:
                     shared_guide_audio_track = self._create_guide_audio_track(liveset, tracks, "Guide")
 
                 if shared_guide_audio_track is not None:
-                    bpm = song.arrangement.bpm if song.arrangement and song.arrangement.bpm else 120
-                    self._add_audio_clip_to_track(shared_guide_audio_track, primary_guide_wav, song_start_beat, bpm, als_file_path)
+                    self._add_audio_clip_to_track(shared_guide_audio_track, primary_guide_wav, song_start_beat, bpm, als_file_path, song_color)
             elif guide_track_idx is not None:
                 guide_stem = self._select_primary_guide_stem(stem_match.stems)
                 if guide_stem is not None:
@@ -410,8 +414,17 @@ class AbletonService:
                     self._add_guide_stem_to_track(tracks, guide_track_idx, guide_stem, song_start_beat)
                 else:
                     logger.debug(f"No guide stem found for '{song.title}'")
-            
-            # Add MIDI clips with arrangement sequence
+
+            if als_file_path is not None:
+                for audio_stem in self._select_song_audio_wavs(stem_match.stems):
+                    logger.info(
+                        f"Adding {audio_stem.stem_type} wav for '{song.title}' at beat {song_start_beat}: {audio_stem.filename}"
+                    )
+                    track_name = self._build_song_audio_track_name(song.title, audio_stem)
+                    new_track = self._create_audio_track(liveset, tracks, track_name, audio_stem.stem_type, song_color)
+                    if new_track is not None:
+                        self._add_audio_clip_to_track(new_track, audio_stem, song_start_beat, bpm, als_file_path, song_color)
+
             if midi_track_idx is not None and song.arrangement and song.arrangement.sequence:
                 logger.info(f"Adding MIDI clips for '{song.title}' with {len(song.arrangement.sequence)} sections")
                 self._add_midi_clips_for_song(tracks, midi_track_idx, song, song_start_beat)
@@ -587,9 +600,11 @@ class AbletonService:
                 max_id = max(max_id, int(elem_id))
         return max_id + 1
 
-    def _get_audio_track_insert_index(self, tracks: ET.Element) -> int:
-        """Insert the generated Guide track after Click and before Pads when possible."""
+    def _get_audio_track_insert_index(self, tracks: ET.Element, stem_type: Optional[str] = None) -> int:
+        """Insert Guide after Click and append other generated audio tracks after Pads."""
         children = list(tracks)
+
+        click_index = None
 
         for index, child in enumerate(children):
             if child.tag != 'MidiTrack':
@@ -598,20 +613,11 @@ class AbletonService:
             name_elem = child.find('Name/EffectiveName')
             track_name = name_elem.get('Value', '') if name_elem is not None else ''
             if 'click' in track_name.lower():
-                return index + 1
+                click_index = index
+                break
 
-        for index, child in enumerate(children):
-            if child.tag != 'GroupTrack':
-                continue
-
-            name_elem = child.find('Name/EffectiveName')
-            track_name = name_elem.get('Value', '') if name_elem is not None else ''
-            if 'pad' in track_name.lower():
-                return index
-
-        for index in range(len(children) - 1, -1, -1):
-            if children[index].tag == 'AudioTrack':
-                return index + 1
+        if stem_type == 'guide' and click_index is not None:
+            return click_index + 1
 
         for index, child in enumerate(children):
             if child.tag in {'ReturnTrack', 'MasterTrack', 'PreHearTrack'}:
@@ -716,12 +722,12 @@ class AbletonService:
         if manual is not None:
             manual.set('Value', str(level))
 
-        active_elem = send.find('Active')
+        active_elem = send_holders[send_index].find('Active')
         if active_elem is not None:
             active_elem.set('Value', 'true' if active else 'false')
 
-    def _configure_guide_audio_track_routing(self, track: ET.Element) -> None:
-        """Route the generated guide track to Sends Only and fully feed returns 8 and 9."""
+    def _configure_generated_audio_track_routing(self, track: ET.Element, stem_type: str) -> None:
+        """Route generated audio tracks to Sends Only and feed the correct category buses."""
         audio_output_routing = track.find('.//AudioOutputRouting')
         if audio_output_routing is not None:
             target = audio_output_routing.find('Target')
@@ -732,8 +738,72 @@ class AbletonService:
             if upper_display is not None:
                 upper_display.set('Value', 'Sends Only')
 
-        self._set_track_send_level(track, 7, 1.0)
-        self._set_track_send_level(track, 8, 1.0)
+        for send_index in self.STEM_SEND_ROUTING.get(stem_type, (8,)):
+            self._set_track_send_level(track, send_index, 1.0)
+
+    def _select_song_audio_wavs(self, stems: List[AudioStem]) -> List[AudioStem]:
+        """Return non-guide WAV stems that can be routed into generated audio tracks."""
+        audio_stems = []
+        for stem in stems:
+            if stem.path.suffix.lower() != '.wav':
+                continue
+            if stem.stem_type == 'guide':
+                continue
+            if stem.stem_type not in self.STEM_SEND_ROUTING:
+                logger.debug(f"Skipping unroutable stem type '{stem.stem_type}' for {stem.filename}")
+                continue
+            audio_stems.append(stem)
+
+        return audio_stems
+
+    def _build_song_audio_track_name(self, song_title: str, stem: AudioStem) -> str:
+        """Build a readable track name for a generated song audio track."""
+        stem_name = stem.path.stem
+        if song_title.lower() in stem_name.lower():
+            return stem_name
+        return f"{song_title} - {stem_name}"
+
+    def _get_song_color_from_click_track(self, tracks: ET.Element, beat_position: float) -> Optional[str]:
+        """Get the click-track clip color for the song section starting at the given beat."""
+        click_track = None
+        for track in tracks.findall('.//MidiTrack'):
+            name_elem = track.find('Name/EffectiveName')
+            track_name = name_elem.get('Value', '') if name_elem is not None else ''
+            if 'click' in track_name.lower():
+                click_track = track
+                break
+
+        if click_track is None:
+            return None
+
+        events = click_track.find('.//ClipTimeable/ArrangerAutomation/Events')
+        if events is None:
+            return None
+
+        candidates = []
+        for clip in events.findall('MidiClip'):
+            clip_time = clip.get('Time')
+            if clip_time is None:
+                continue
+
+            try:
+                clip_time_value = float(clip_time)
+            except ValueError:
+                continue
+
+            color_elem = clip.find('Color')
+            color_value = color_elem.get('Value') if color_elem is not None else None
+            if color_value is None:
+                continue
+
+            candidates.append((clip_time_value, color_value))
+
+        exact_match = next((color for time, color in candidates if abs(time - beat_position) < 0.0001), None)
+        if exact_match is not None:
+            return exact_match
+
+        next_match = next((color for time, color in sorted(candidates) if time >= beat_position), None)
+        return next_match
 
     def _remap_audio_track_internal_ids(self, track: ET.Element, start_id: int) -> int:
         """Remap global-style IDs inside the inserted blank audio track."""
@@ -855,6 +925,7 @@ class AbletonService:
         beat_position: float,
         bpm: float,
         als_file_path: Path,
+        clip_color: Optional[str] = None,
     ) -> ET.Element:
         """Create an Ableton-style AudioClip element for a guide WAV."""
         clip = copy.deepcopy(self.audio_clip_template)
@@ -891,6 +962,9 @@ class AbletonService:
             'SampleRef/DefaultSampleRate': sample_rate,
         }
 
+        if clip_color is not None:
+            updates['Color'] = clip_color
+
         for path, value in updates.items():
             target = clip.find(path)
             if target is not None:
@@ -914,6 +988,7 @@ class AbletonService:
         beat_position: float,
         bpm: float,
         als_file_path: Path,
+        clip_color: Optional[str] = None,
     ) -> None:
         """Add an arranger audio clip to a blank guide audio track."""
         events = track.find('.//MainSequencer/Sample/ArrangerAutomation/Events')
@@ -921,7 +996,7 @@ class AbletonService:
             logger.error("MainSequencer Sample ArrangerAutomation Events not found in guide track")
             return
 
-        clip = self._create_audio_clip_element(guide_wav, beat_position, bpm, als_file_path)
+        clip = self._create_audio_clip_element(guide_wav, beat_position, bpm, als_file_path, clip_color)
         existing_ids = [int(existing.get('Id', '0')) for existing in events.findall('AudioClip') if existing.get('Id', '0').isdigit()]
         clip.set('Id', str(max(existing_ids, default=0) + 1))
         events.append(clip)
@@ -1067,7 +1142,14 @@ class AbletonService:
         
         logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track (slot {slot_id})")
 
-    def _create_guide_audio_track(self, liveset: ET.Element, tracks: ET.Element, track_name: str) -> Optional[ET.Element]:
+    def _create_audio_track(
+        self,
+        liveset: ET.Element,
+        tracks: ET.Element,
+        track_name: str,
+        stem_type: str,
+        track_color: Optional[str] = None,
+    ) -> Optional[ET.Element]:
         """Create a new blank audio track without depending on the current template's tracks."""
         try:
             new_track = copy.deepcopy(self.blank_audio_track_template)
@@ -1095,14 +1177,14 @@ class AbletonService:
 
             color_elem = new_track.find('Color')
             if color_elem is not None:
-                color_elem.set('Value', '13')
+                color_elem.set('Value', track_color or '13')
 
-            self._configure_guide_audio_track_routing(new_track)
+            self._configure_generated_audio_track_routing(new_track, stem_type)
 
             for selected_elem in new_track.iter('IsContentSelectedInDocument'):
                 selected_elem.set('Value', 'false')
 
-            tracks.insert(self._get_audio_track_insert_index(tracks), new_track)
+            tracks.insert(self._get_audio_track_insert_index(tracks, stem_type), new_track)
             self._update_next_pointee_id(liveset)
 
             logger.info(
@@ -1111,8 +1193,12 @@ class AbletonService:
             return new_track
 
         except Exception as e:
-            logger.error(f"Failed to create guide audio track '{track_name}': {e}", exc_info=True)
+            logger.error(f"Failed to create audio track '{track_name}': {e}", exc_info=True)
             return None
+
+    def _create_guide_audio_track(self, liveset: ET.Element, tracks: ET.Element, track_name: str) -> Optional[ET.Element]:
+        """Create the shared guide audio track using the guide routing profile."""
+        return self._create_audio_track(liveset, tracks, track_name, 'guide')
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips in ArrangerAutomation/Events for arrangement playback."""
