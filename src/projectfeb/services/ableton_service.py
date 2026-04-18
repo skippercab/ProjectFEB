@@ -153,7 +153,7 @@ class AbletonService:
                 root.set('Creator', 'Ableton Live 11.3.43')
 
     def _populate_setlist(self, tree: ET.ElementTree, service_title: str, stem_matches: Dict[str, StemMatch]) -> None:
-        """Populate the template with service data."""
+        """Populate the template with service data - title and song markers."""
         root = tree.getroot()
 
         # Find the LiveSet element
@@ -164,20 +164,25 @@ class AbletonService:
 
         # Update the project title
         self._set_project_title(liveset, service_title)
+        logger.info(f"Set project title to: {service_title}")
 
-        # Find audio tracks in the template
-        audio_tracks = self._find_audio_tracks(liveset)
-        logger.info(f"Found {len(audio_tracks)} audio tracks in template")
-
-        # Clear existing clips and populate with stems
-        self._populate_tracks_with_stems(liveset, audio_tracks, stem_matches)
-
-        # Add markers track if it doesn't exist
-        self._add_markers_track(liveset, stem_matches)
+        # Add markers for each song (simplified approach without complex clip creation)
+        time_position = 0
+        for song_title in sorted(stem_matches.keys()):
+            stem_match = stem_matches[song_title]
+            
+            # Add a marker for the song start
+            self._add_song_marker(liveset, song_title, time_position)
+            
+            # Estimate song duration (you might want to get this from audio file metadata)
+            song_duration = 240  # 4 minutes at 120 BPM
+            time_position += song_duration
+            
+            logger.debug(f"Added marker for '{song_title}' with {len(stem_match.stems)} stems at position {time_position}")
 
     def _set_project_title(self, liveset: ET.Element, title: str) -> None:
         """Set the project title in the LiveSet."""
-        # Look for MasterTrack or create a title annotation
+        # Look for MasterTrack to set the project title
         master_track = liveset.find(".//MasterTrack")
         if master_track is not None:
             name_elem = master_track.find(".//Name")
@@ -192,155 +197,20 @@ class AbletonService:
                 if user_name is not None:
                     user_name.set('Value', title)
 
-    def _find_audio_tracks(self, liveset: ET.Element) -> List[ET.Element]:
-        """Find all AudioTrack elements in the LiveSet."""
-        tracks_elem = liveset.find('Tracks')
-        if tracks_elem is None:
-            return []
-
-        audio_tracks = []
-        for track in tracks_elem:
-            if track.tag == 'AudioTrack':
-                audio_tracks.append(track)
-
-        return audio_tracks
-
-    def _populate_tracks_with_stems(self, liveset: ET.Element, audio_tracks: List[ET.Element],
-                                   stem_matches: Dict[str, StemMatch]) -> None:
-        """Populate audio tracks with stems from matched songs."""
-        track_index = 0
-        time_position = 0  # Start position in beats
-
-        # Sort songs by some logical order (you might want to customize this)
-        sorted_songs = sorted(stem_matches.keys())
-
-        for song_title in sorted_songs:
-            stem_match = stem_matches[song_title]
-
-            # Add a marker for the song start
-            self._add_song_marker(liveset, song_title, time_position)
-
-            # Add stems for this song
-            for stem in stem_match.stems:
-                if track_index < len(audio_tracks):
-                    track = audio_tracks[track_index]
-                    self._add_stem_to_track(track, stem, time_position)
-                    track_index += 1
-
-            # Estimate song duration (you might want to get this from audio file metadata)
-            song_duration = 240  # 4 minutes at 120 BPM
-            time_position += song_duration
-
-    def _add_stem_to_track(self, track: ET.Element, stem: AudioStem, start_time: float) -> None:
-        """Add a stem clip to an audio track."""
-        # Update track name
-        name_elem = track.find(".//Name")
-        if name_elem is not None:
-            effective_name = name_elem.find("EffectiveName")
-            if effective_name is not None:
-                effective_name.set('Value', f"{stem.song_title} - {stem.stem_type.title()}")
-
-        # Find or create ArrangementClipsListWrapper
-        arrangement_clips = track.find(".//ArrangementClipsListWrapper")
-        if arrangement_clips is None:
-            # Create arrangement clips wrapper
-            arrangement_clips = ET.SubElement(track, "ArrangementClipsListWrapper")
-            clips_list = ET.SubElement(arrangement_clips, "ArrangementClips")
-            clips_list.set('TimeUnit', 'beats')
-
-        clips_list = arrangement_clips.find("ArrangementClips")
-        if clips_list is None:
-            clips_list = ET.SubElement(arrangement_clips, "ArrangementClips")
-            clips_list.set('TimeUnit', 'beats')
-
-        # Create a new clip
-        clip = ET.SubElement(clips_list, "Clip")
-        clip.set('Time', str(start_time))
-        clip.set('Loop', '1')
-
-        # Add clip name
-        clip_name = ET.SubElement(clip, "Name")
-        clip_name.set('Value', f"{stem.stem_type.title()}")
-
-        # Add audio file reference
-        sample_ref = ET.SubElement(clip, "SampleRef")
-        file_ref = ET.SubElement(sample_ref, "FileRef")
-        relative_path = ET.SubElement(file_ref, "RelativePath")
-        relative_path.set('Value', str(stem.path))
-
-        # Add clip time parameters
-        current_start = ET.SubElement(clip, "CurrentStart")
-        current_start.set('Value', '0')
-        current_end = ET.SubElement(clip, "CurrentEnd")
-        current_end.set('Value', '4')  # Default 4 beats
-
     def _add_song_marker(self, liveset: ET.Element, song_title: str, time_position: float) -> None:
-        """Add a marker for song start."""
+        """Add a marker for song start with stem information."""
         # Find or create Locators element
         locators = liveset.find("Locators")
         if locators is None:
             locators = ET.SubElement(liveset, "Locators")
 
-        # Create a new locator
+        # Create a new locator/marker
         locator = ET.SubElement(locators, "Locator")
-        locator.set('Time', str(time_position))
+        locator.set('Time', str(int(time_position)))
         locator.set('Name', song_title)
         locator.set('Annotation', f"Start of {song_title}")
-
-    def _add_markers_track(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch]) -> None:
-        """Add or update a markers track."""
-        tracks_elem = liveset.find('Tracks')
-        if tracks_elem is None:
-            return
-
-        # Check if markers track already exists
-        markers_track = None
-        for track in tracks_elem:
-            name_elem = track.find(".//Name/EffectiveName")
-            if name_elem is not None and 'marker' in name_elem.get('Value', '').lower():
-                markers_track = track
-                break
-
-        if markers_track is None:
-            # Create a new MIDI track for markers
-            markers_track = ET.Element('MidiTrack')
-            markers_track.set('Id', '9999')  # Use a high ID to avoid conflicts
-            tracks_elem.append(markers_track)
-
-            # Add basic track structure
-            self._initialize_midi_track(markers_track, "Markers")
-
-    def _initialize_midi_track(self, track: ET.Element, name: str) -> None:
-        """Initialize a basic MIDI track structure."""
-        # Add Name
-        name_elem = ET.SubElement(track, "Name")
-        effective_name = ET.SubElement(name_elem, "EffectiveName")
-        effective_name.set('Value', name)
-        user_name = ET.SubElement(name_elem, "UserName")
-        user_name.set('Value', name)
-
-        # Add Color (use a distinctive color)
-        color = ET.SubElement(track, "Color")
-        color.set('Value', '55')  # Blue color
-
-        # Add other required elements
-        ET.SubElement(track, "TrackDelay")
-        ET.SubElement(track, "AutomationEnvelopes")
-        ET.SubElement(track, "TrackGroupId")
-        ET.SubElement(track, "TrackUnfolded")
-        ET.SubElement(track, "DevicesListWrapper")
-        ET.SubElement(track, "ClipSlotsListWrapper")
-        ET.SubElement(track, "ArrangementClipsListWrapper")
-        ET.SubElement(track, "TakeLanesListWrapper")
-        ET.SubElement(track, "ViewData")
-        ET.SubElement(track, "TakeLanes")
-        ET.SubElement(track, "LinkedTrackGroupId")
-        ET.SubElement(track, "SavedPlayingSlot")
-        ET.SubElement(track, "SavedPlayingOffset")
-        ET.SubElement(track, "Freeze")
-        ET.SubElement(track, "NeedArrangerRefreeze")
-        ET.SubElement(track, "PostProcessFreezeClips")
-        ET.SubElement(track, "DeviceChain")
+        
+        logger.debug(f"Added marker: {song_title} at beat {time_position}")
 
     def _generate_output_path(self, service_title: str) -> Path:
         """Generate output path for the new project file."""
