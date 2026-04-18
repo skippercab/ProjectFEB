@@ -198,19 +198,42 @@ class AbletonService:
                     user_name.set('Value', title)
 
     def _add_song_marker(self, liveset: ET.Element, song_title: str, time_position: float) -> None:
-        """Add a marker for song start with stem information."""
+        """Add a marker for song start with proper Ableton Locator structure."""
         # Find or create Locators element
         locators = liveset.find("Locators")
         if locators is None:
             locators = ET.SubElement(liveset, "Locators")
 
-        # Create a new locator/marker
-        locator = ET.SubElement(locators, "Locator")
-        locator.set('Time', str(int(time_position)))
-        locator.set('Name', song_title)
-        locator.set('Annotation', f"Start of {song_title}")
-        
-        logger.debug(f"Added marker: {song_title} at beat {time_position}")
+        # Find or create nested Locators list
+        locators_list = locators.find("Locators")
+        if locators_list is None:
+            locators_list = ET.SubElement(locators, "Locators")
+
+        # Count existing locators to get the next ID
+        existing_locators = locators_list.findall("Locator")
+        locator_id = len(existing_locators)
+
+        # Create a new Locator element with proper structure
+        locator = ET.SubElement(locators_list, "Locator")
+        locator.set('Id', str(locator_id))
+
+        # Add LomId (required element)
+        lom_id = ET.SubElement(locator, "LomId")
+        lom_id.set('Value', '0')
+
+        # Add Time value
+        time_elem = ET.SubElement(locator, "Time")
+        time_elem.set('Value', str(int(time_position)))
+
+        # Add Name
+        name_elem = ET.SubElement(locator, "Name")
+        name_elem.set('Value', song_title)
+
+        # Add Annotation
+        annotation_elem = ET.SubElement(locator, "Annotation")
+        annotation_elem.set('Value', '')
+
+        logger.debug(f"Added locator: {song_title} at beat {time_position} with ID {locator_id}")
 
     def _generate_output_path(self, service_title: str) -> Path:
         """Generate output path for the new project file."""
