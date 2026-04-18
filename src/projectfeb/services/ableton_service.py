@@ -166,19 +166,43 @@ class AbletonService:
         self._set_project_title(liveset, service_title)
         logger.info(f"Set project title to: {service_title}")
 
-        # Add markers for each song (simplified approach without complex clip creation)
-        time_position = 0
-        for song_title in sorted(stem_matches.keys()):
-            stem_match = stem_matches[song_title]
-            
-            # Add a marker for the song start
-            self._add_song_marker(liveset, song_title, time_position)
-            
-            # Estimate song duration (you might want to get this from audio file metadata)
-            song_duration = 240  # 4 minutes at 120 BPM
-            time_position += song_duration
-            
-            logger.debug(f"Added marker for '{song_title}' with {len(stem_match.stems)} stems at position {time_position}")
+        # Replace existing placeholder markers with actual song titles
+        self._populate_existing_markers(liveset, stem_matches)
+
+    def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch]) -> None:
+        """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles."""
+        # Find the Locators element
+        locators = liveset.find("Locators")
+        if locators is None:
+            logger.warning("No Locators element found in template")
+            return
+
+        locators_list = locators.find("Locators")
+        if locators_list is None:
+            logger.warning("No Locators/Locators element found in template")
+            return
+
+        # Get all existing locator elements
+        existing_locators = locators_list.findall("Locator")
+        logger.info(f"Found {len(existing_locators)} placeholder markers in template")
+
+        # Get sorted song titles
+        sorted_songs = sorted(stem_matches.keys())
+        logger.info(f"Have {len(sorted_songs)} songs to assign to markers")
+
+        # Replace each placeholder marker with actual song title
+        for i, locator in enumerate(existing_locators):
+            if i < len(sorted_songs):
+                song_title = sorted_songs[i]
+                name_elem = locator.find("Name")
+                if name_elem is not None:
+                    old_name = name_elem.get('Value', '')
+                    name_elem.set('Value', song_title)
+                    logger.info(f"Marker {i}: Replaced '{old_name}' with '{song_title}'")
+                else:
+                    logger.warning(f"Marker {i}: No Name element found")
+            else:
+                logger.warning(f"More markers than songs: marker {i} has no song to assign")
 
     def _set_project_title(self, liveset: ET.Element, title: str) -> None:
         """Set the project title in the LiveSet."""
