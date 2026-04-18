@@ -309,8 +309,11 @@ class AbletonService:
                 logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/MIDI")
                 continue
             
-            # Find the marker name for this song (e.g., "1) The Blood (B)")
+            # Find the marker name for this song, including key if available (e.g., "1) The Blood (B)")
             marker_key = f"{song_idx + 1}) {song.title}"
+            if song.key_name:
+                marker_key += f" ({song.key_name})"
+            
             if marker_key not in locators_map:
                 logger.warning(f"Marker '{marker_key}' not found in template")
                 continue
