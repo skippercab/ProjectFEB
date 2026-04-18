@@ -10,6 +10,7 @@ from loguru import logger
 import shutil
 import tempfile
 import os
+import copy
 
 from ..core.config import AbletonConfig
 from .multitracks_service import AudioStem, StemMatch
@@ -36,22 +37,24 @@ class AbletonService:
         self.template_path = Path(config.template_path) if config.template_path else None
         self.output_folder = Path(config.output_folder) if config.output_folder else Path.home() / "Desktop"
         self.template_format = None  # Will be set to 'zip' or 'gzip' when loading template
+        self.template_midi_clip = None  # Template MidiClip to use as base for copies
 
         # Ensure output folder exists
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Ableton service initialized with template: {self.template_path}")
 
-    def generate_setlist(self, service_title: str, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> Optional[Path]:
+    def generate_setlist(self, service_type_name: str, service_date, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> Optional[Path]:
         """Generate an Ableton Live setlist from stem matches.
 
         Args:
-            service_title: Title for the service/setlist
+            service_type_name: Name of the service type (e.g., "SMC Weekend Services")
+            service_date: Date of the service (datetime object)
             stem_matches: Dictionary of song titles to stem matches
             plan_songs: Optional ordered list of PCOSong objects with key information
 
         Returns:
-            Path to the generated .als file, or None if failed
+            Path to the project folder, or None if failed
         """
         if not self.template_path or not self.template_path.exists():
             logger.error(f"Template file not found: {self.template_path}")
@@ -66,15 +69,18 @@ class AbletonService:
             # Convert to target Ableton version if needed
             self._convert_version(template_tree)
 
+            # Create a project title for the Ableton window from service type and date
+            project_title = f"{service_type_name} {service_date.strftime('%Y-%m-%d')}"
+            
             # Modify the template with service data
-            self._populate_setlist(template_tree, service_title, stem_matches, plan_songs)
+            self._populate_setlist(template_tree, project_title, stem_matches, plan_songs)
 
             # Save the new project file
-            output_path = self._generate_output_path(service_title)
-            self._save_project(template_tree, output_path)
+            als_file_path = self._generate_output_path(service_type_name, service_date)
+            self._save_project(template_tree, als_file_path)
 
-            logger.info(f"Generated setlist: {output_path}")
-            return output_path
+            logger.info(f"Generated setlist: {als_file_path}")
+            return als_file_path
 
         except Exception as e:
             logger.error(f"Failed to generate setlist: {e}")
@@ -116,6 +122,7 @@ class AbletonService:
                     tree = ET.ElementTree(root)
 
                     self.template_format = 'zip'
+                    self._extract_template_midi_clip(root)
                     logger.info(f"Template loaded successfully from ZIP: {project_xml_path}")
                     return tree
 
@@ -130,12 +137,50 @@ class AbletonService:
                 tree = ET.ElementTree(root)
 
                 self.template_format = 'gzip'
+                self._extract_template_midi_clip(root)
                 logger.info("Template loaded successfully from gzip format")
                 return tree
 
         except Exception as e:
             logger.error(f"Failed to load template: {e}")
             return None
+
+    def _extract_template_midi_clip(self, root: ET.Element) -> None:
+        """Extract a working template MidiClip (INTRO) to use as a base for copies.
+        
+        The INTRO clip is known to render properly in Ableton, so we duplicate
+        its exact structure when creating new clips. This ensures new clips have
+        all the necessary fields for Ableton to display them.
+        """
+        try:
+            # Find the INTRO MidiClip in ArrangerAutomation/Events
+            # This is a known working clip that displays properly in Ableton
+            for midi_track in root.findall('.//MidiTrack'):
+                clip_timeable = midi_track.find('.//ClipTimeable')
+                if clip_timeable is not None:
+                    events = clip_timeable.find('.//ArrangerAutomation/Events')
+                    if events is not None:
+                        # Look for the INTRO clip specifically (it's known to work)
+                        for midi_clip in events.findall('MidiClip'):
+                            name_elem = midi_clip.find('Name')
+                            if name_elem is not None:
+                                clip_name = name_elem.get('Value', '')
+                                if clip_name == 'INTRO':
+                                    # Store a deep copy of this working clip
+                                    self.template_midi_clip = copy.deepcopy(midi_clip)
+                                    logger.info(f"Extracted working template INTRO MidiClip: Id={midi_clip.get('Id')}")
+                                    return
+                        
+                        # Fallback: if no INTRO found, use first clip
+                        midi_clip = events.find('MidiClip')
+                        if midi_clip is not None:
+                            name_elem = midi_clip.find('Name')
+                            clip_name = name_elem.get('Value', 'unknown') if name_elem is not None else 'unknown'
+                            self.template_midi_clip = copy.deepcopy(midi_clip)
+                            logger.info(f"Extracted template MidiClip (fallback): Id={midi_clip.get('Id')}, Name={clip_name}")
+                            return
+        except Exception as e:
+            logger.warning(f"Failed to extract template MidiClip: {e}")
 
     def _convert_version(self, tree: ET.ElementTree) -> None:
         """Convert the Ableton project version if needed."""
@@ -173,6 +218,8 @@ class AbletonService:
         # Add guide stems and MIDI clips for each song (if arrangement data available)
         if plan_songs:
             self._add_guides_and_midi_clips(liveset, stem_matches, plan_songs)
+            # Add tempo mapping for each song
+            self._add_tempo_mapping(liveset, plan_songs)
 
     def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
         """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles and keys."""
@@ -296,12 +343,14 @@ class AbletonService:
             return
         
         guide_track_idx = self._find_track_by_name(tracks, "Guide")
-        midi_track_idx = self._find_midi_track_by_name(tracks, "MIDI") or self._find_midi_track_by_name(tracks, "Count")
+        
+        # Create a brand new MIDI track for the arrangement clips at the top
+        midi_track_idx = self._create_arrangement_track(tracks)
         
         if guide_track_idx is None:
             logger.warning("Guide track not found")
         if midi_track_idx is None:
-            logger.warning("MIDI/Count track not found for arrangement sections")
+            logger.warning("Failed to create arrangement track")
         
         # Process each song
         for song_idx, song in enumerate(plan_songs):
@@ -336,6 +385,116 @@ class AbletonService:
             if midi_track_idx is not None and song.arrangement and song.arrangement.sequence:
                 logger.info(f"Adding MIDI clips for '{song.title}' with {len(song.arrangement.sequence)} sections")
                 self._add_midi_clips_for_song(tracks, midi_track_idx, song, song_start_beat)
+
+    def _add_tempo_mapping(self, liveset: ET.Element, plan_songs: List) -> None:
+        """Add tempo automation events for each song based on their BPM values."""
+        try:
+            # Get locators to find song start positions
+            locators_map = self._get_locators_map(liveset)
+            
+            # Find the MasterTrack which contains the tempo automation
+            master_track = liveset.find(".//MasterTrack")
+            if master_track is None:
+                logger.warning("No MasterTrack found, skipping tempo mapping")
+                return
+            
+            # Find the AutomationEnvelopes element
+            auto_envelopes = master_track.find(".//AutomationEnvelopes")
+            if auto_envelopes is None:
+                logger.warning("No AutomationEnvelopes found in MasterTrack")
+                return
+            
+            # Find the Envelopes container
+            envelopes_container = auto_envelopes.find("Envelopes")
+            if envelopes_container is None:
+                logger.warning("No Envelopes container found in AutomationEnvelopes")
+                return
+            
+            # Find the tempo automation envelope (PointeeId="8" points to Tempo target)
+            tempo_envelope = None
+            for envelope in envelopes_container.findall("AutomationEnvelope"):
+                target = envelope.find("EnvelopeTarget/PointeeId")
+                if target is not None and target.get("Value") == "8":
+                    tempo_envelope = envelope
+                    break
+            
+            if tempo_envelope is None:
+                logger.warning("Tempo automation envelope not found, skipping tempo mapping")
+                return
+            
+            # Get the Events container
+            automation = tempo_envelope.find("Automation")
+            if automation is None:
+                logger.warning("No Automation element in tempo envelope")
+                return
+            
+            events = automation.find("Events")
+            if events is None:
+                logger.warning("No Events element in tempo automation")
+                return
+            
+            # Clear all existing FloatEvent entries and rebuild them
+            for event in events.findall("FloatEvent"):
+                events.remove(event)
+            
+            # Collect all BPM values from songs
+            song_bpms = []
+            for song_idx, song in enumerate(plan_songs):
+                if not song.arrangement or not song.arrangement.bpm:
+                    logger.warning(f"Song '{song.title}' has no arrangement BPM")
+                    song_bpms.append(120)  # Default to 120
+                else:
+                    song_bpms.append(song.arrangement.bpm)
+                    logger.info(f"Song {song_idx + 1} '{song.title}' BPM: {song.arrangement.bpm}")
+            
+            # Create new tempo events for each song
+            # Start with initial BPM at very early time
+            event_id = 0
+            initial_event = ET.Element("FloatEvent")
+            initial_event.set("Id", str(event_id))
+            initial_event.set("Time", "-63072000")  # Very early, before song starts
+            initial_event.set("Value", str(song_bpms[0]))
+            events.append(initial_event)
+            event_id += 1
+            
+            # For each subsequent song, create tempo ramp events at transition points
+            for song_idx in range(1, len(plan_songs)):
+                song = plan_songs[song_idx]
+                
+                # Find the marker name for this song
+                marker_key = f"{song_idx + 1}) {song.title}"
+                if song.key_name:
+                    marker_key += f" ({song.key_name})"
+                
+                if marker_key not in locators_map:
+                    logger.warning(f"Marker '{marker_key}' not found, skipping tempo event")
+                    continue
+                
+                song_start_beat = locators_map[marker_key]
+                prev_bpm = song_bpms[song_idx - 1]
+                curr_bpm = song_bpms[song_idx]
+                
+                # Create two events at this beat for smooth tempo ramp:
+                # First event: keep previous BPM (smooth transition start)
+                ramp_start = ET.Element("FloatEvent")
+                ramp_start.set("Id", str(event_id))
+                ramp_start.set("Time", str(int(song_start_beat)))
+                ramp_start.set("Value", str(prev_bpm))  # Keep original value (may be decimal)
+                events.append(ramp_start)
+                event_id += 1
+                
+                # Second event: new song BPM (ramp target)
+                ramp_end = ET.Element("FloatEvent")
+                ramp_end.set("Id", str(event_id))
+                ramp_end.set("Time", str(int(song_start_beat)))
+                ramp_end.set("Value", str(curr_bpm))  # Keep original value (may be decimal)
+                events.append(ramp_end)
+                event_id += 1
+                
+                logger.info(f"Added tempo ramp at beat {song_start_beat}: {prev_bpm} → {curr_bpm} for '{song.title}'")
+                
+        except Exception as e:
+            logger.error(f"Failed to add tempo mapping: {e}")
 
     def _get_locators_map(self, liveset: ET.Element) -> Dict[str, float]:
         """Extract marker names and their beat positions from locators."""
@@ -389,29 +548,110 @@ class AbletonService:
         
         return None
 
+    def _create_arrangement_track(self, tracks: ET.Element) -> Optional[int]:
+        """Create a brand new MIDI track at the top for arrangement clips.
+        
+        Returns the index of the new track (0), or None if creation failed.
+        """
+        # Find a template MIDI track to use as a base (prefer Markers)
+        midi_tracks = tracks.findall(".//MidiTrack")
+        if not midi_tracks:
+            logger.error("No existing MIDI tracks found to use as template")
+            return None
+        
+        template_track = None
+        for track in midi_tracks:
+            name_elem = track.find(".//Name/EffectiveName")
+            if name_elem is not None and name_elem.get('Value') == 'Markers':
+                template_track = track
+                break
+        
+        # If Markers not found, use the first MIDI track
+        if template_track is None:
+            template_track = midi_tracks[0]
+        
+        # Deep copy the template track
+        new_track = copy.deepcopy(template_track)
+        
+        # Get the highest track ID in use
+        max_id = 0
+        for track in midi_tracks:
+            try:
+                track_id = int(track.get('Id', '0'))
+                max_id = max(max_id, track_id)
+            except ValueError:
+                pass
+        
+        # Assign a new unique ID
+        new_track.set('Id', str(max_id + 100))
+        
+        # Set the track name to "Arrangement"
+        name_elem = new_track.find(".//Name/EffectiveName")
+        if name_elem is not None:
+            name_elem.set('Value', 'Arrangement')
+        
+        # Clear out any existing clips from the new track
+        ct = new_track.find(".//ClipTimeable")
+        if ct is not None:
+            events = ct.find("ArrangerAutomation/Events")
+            if events is not None:
+                # Remove all existing clips
+                for clip in list(events):
+                    events.remove(clip)
+        
+        # Clear ClipSlotsListWrapper
+        csw = new_track.find(".//ClipSlotsListWrapper")
+        if csw is not None:
+            # Remove any children to make it empty
+            for child in list(csw):
+                csw.remove(child)
+            # Set LomId attribute
+            csw.set('LomId', '0')
+        
+        # Insert the new track before the first existing MidiTrack to maintain structure
+        # Find the position of the first MidiTrack
+        first_midi_idx = None
+        children = list(tracks)
+        
+        for i, child in enumerate(children):
+            if child.tag == 'MidiTrack':
+                first_midi_idx = i
+                break
+        
+        # If found, insert before it; otherwise append to end
+        if first_midi_idx is not None:
+            tracks.insert(first_midi_idx, new_track)
+            logger.info(f"Created new arrangement track with ID {max_id + 100} before first MidiTrack")
+        else:
+            tracks.append(new_track)
+            logger.info(f"Created new arrangement track with ID {max_id + 100} (appended to end)")
+        
+        return 0  # The new track is now at index 0 (or first position)
+
     def _add_guide_stem_to_track(self, tracks: ET.Element, track_idx: int, guide_stem: AudioStem, beat_position: float) -> None:
         """Add a guide stem audio clip to the Guide track, referencing the existing .wav file."""
         # Get all audio tracks
         audio_tracks = tracks.findall(".//AudioTrack")
         
         if track_idx >= len(audio_tracks):
-            logger.warning(f"Track index {track_idx} out of range")
+            logger.warning(f"Audio track index {track_idx} out of range")
             return
         
         guide_track = audio_tracks[track_idx]
         
-        # Find or create ClipSlotsListWrapper
+        # Find ClipSlotsListWrapper (should exist in template)
         clip_slots_wrapper = guide_track.find(".//ClipSlotsListWrapper")
         if clip_slots_wrapper is None:
             logger.error("ClipSlotsListWrapper not found in audio track")
             return
         
-        # Check if wrapper has children, if not create the structure
+        # Find existing ClipSlotList or create one
         clip_slot_list = clip_slots_wrapper.find("ClipSlotList")
         if clip_slot_list is None:
+            logger.debug("ClipSlotList not found, creating one")
             clip_slot_list = ET.SubElement(clip_slots_wrapper, "ClipSlotList")
         
-        # Get the current number of clip slots to determine slot ID
+        # Get the current number of clip slots
         existing_slots = clip_slot_list.findall("ClipSlot")
         slot_id = len(existing_slots)
         
@@ -419,7 +659,7 @@ class AbletonService:
         clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
         clip_slot.set('Id', str(slot_id))
         
-        # Create AudioClip element
+        # Create AudioClip element with proper file reference
         audio_clip = ET.SubElement(clip_slot, "AudioClip")
         audio_clip.set('Id', '0')
         audio_clip.set('Time', str(int(beat_position)))
@@ -446,10 +686,10 @@ class AbletonService:
         path_elem = ET.SubElement(file_ref, "Path")
         path_elem.set('Value', str(guide_stem.path))
         
-        logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track")
+        logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track (slot {slot_id})")
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
-        """Create MIDI clips with arrangement sequence markers for a song."""
+        """Create MIDI clips in ArrangerAutomation/Events for arrangement playback."""
         if not song.arrangement or not song.arrangement.sequence:
             logger.debug(f"No arrangement sequence for {song.title}")
             return
@@ -465,240 +705,186 @@ class AbletonService:
         
         midi_track = midi_tracks[midi_track_idx]
         
-        # Find or create ClipSlotsListWrapper with proper structure
-        clip_slots_wrapper = midi_track.find(".//ClipSlotsListWrapper")
-        if clip_slots_wrapper is None:
-            logger.error("ClipSlotsListWrapper not found in MIDI track")
+        # Find the ArrangerAutomation/Events structure (where MIDI arrangement clips go)
+        clip_timeable = midi_track.find(".//ClipTimeable")
+        if clip_timeable is None:
+            logger.error("ClipTimeable not found in MIDI track")
             return
         
-        # Check if wrapper has children, if not create the structure
-        clip_slot_list = clip_slots_wrapper.find("ClipSlotList")
-        if clip_slot_list is None:
-            # Create the container structure
-            clip_slot_list = ET.SubElement(clip_slots_wrapper, "ClipSlotList")
+        arranger_automation = clip_timeable.find("ArrangerAutomation")
+        if arranger_automation is None:
+            logger.error("ArrangerAutomation not found in ClipTimeable")
+            return
         
-        # Estimate beats per section
-        song_duration_beats = 240
-        beats_per_section = song_duration_beats / num_sections if num_sections > 0 else song_duration_beats
+        events = arranger_automation.find("Events")
+        if events is None:
+            logger.warning("Events not found, creating it")
+            events = ET.SubElement(arranger_automation, "Events")
         
-        logger.info(f"Adding {num_sections} MIDI clips for '{song.title}'")
+        # Estimate beats per section (allocate remaining time after template intro)
+        # Template has COUNT (0-4) and INTRO (4-20), so real content starts at beat 20
+        # Allocate remaining 220 beats (240 - 20) for arrangement sections
+        template_intro_duration = 20  # beats 4-20
+        available_song_duration = 240 - template_intro_duration
+        beats_per_section = available_song_duration / num_sections if num_sections > 0 else available_song_duration
         
-        # Get the current number of clip slots to determine slot ID
-        existing_slots = clip_slot_list.findall("ClipSlot")
-        start_slot_id = len(existing_slots)
+        # Get the highest existing MidiClip ID
+        existing_clips = events.findall("MidiClip")
+        max_id = 0
+        for clip in existing_clips:
+            try:
+                clip_id = int(clip.get('Id', '0'))
+                max_id = max(max_id, clip_id)
+            except ValueError:
+                pass
+        
+
+        
+        logger.info(f"Adding {num_sections} MIDI clips for '{song.title}' to ArrangerAutomation (starting at ID {max_id + 1})")
+        logger.info(f"  Song starts at beat {beat_position}, arrangement sections start at beat {beat_position + template_intro_duration}")
+        logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration} available beats")
         
         for section_idx, section_name in enumerate(sequence):
-            section_beat_position = beat_position + (section_idx * beats_per_section)
+            # Start arrangement sections after the template intro (which ends at beat 20)
+            section_beat_position = beat_position + template_intro_duration + (section_idx * beats_per_section)
             section_duration = beats_per_section
             
-            # Create ClipSlot container
-            clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
-            clip_slot.set('Id', str(start_slot_id + section_idx))
+            # Create the MidiClip element directly in Events
+            clip_id = max_id + section_idx + 1
+            midi_clip = self._create_midi_clip_element(
+                name=section_name, 
+                beat_position=int(section_beat_position),  # Convert to int for XML
+                duration=section_duration,
+                clip_id=clip_id
+            )
+            events.append(midi_clip)
             
-            # Create the MidiClip with minimal required structure
-            midi_clip = self._create_midi_clip_element(section_name, int(section_beat_position), int(section_duration))
-            clip_slot.append(midi_clip)
-            
-            logger.debug(f"  Added MIDI clip: {section_name} at beat {section_beat_position} (duration: {section_duration})")
+            logger.debug(f"  Added MIDI clip: {section_name} at beat {section_beat_position:.1f} (ID {clip_id})")
 
-    def _create_midi_clip_element(self, name: str, beat_position: int, duration: int) -> ET.Element:
-        """Create a properly structured MidiClip element with all required Ableton attributes."""
-        clip = ET.Element("MidiClip")
-        clip.set('Id', '0')
-        clip.set('Time', str(beat_position))
+    def _get_clip_color(self, section_name: str) -> int:
+        """Get color code for a clip based on section type.
         
-        # LomId and LomIdView
-        lom_id = ET.SubElement(clip, "LomId")
-        lom_id.set('Value', '0')
-        lom_id_view = ET.SubElement(clip, "LomIdView")
-        lom_id_view.set('Value', '0')
+        Ableton color codes (extracted from user's manually-selected colors):
+        Intro=58, Verse=63, Chorus=56, Bridge=68, 
+        Turnaround=66, Interlude=66, Instrumental=66, Tag=65, Ending=69
+        """
+        section_lower = section_name.lower()
         
-        # Current boundaries
-        current_start = ET.SubElement(clip, "CurrentStart")
-        current_start.set('Value', '0')
-        current_end = ET.SubElement(clip, "CurrentEnd")
-        current_end.set('Value', str(duration))
+        if 'verse' in section_lower:
+            return 63  # Light blue/cyan
+        elif 'chorus' in section_lower:
+            return 56  # Pink/magenta
+        elif 'bridge' in section_lower:
+            return 68  # Purple
+        elif 'turnaround' in section_lower or 'turn' in section_lower:
+            return 66  # Teal
+        elif 'tag' in section_lower:
+            return 65  # Blue
+        elif 'ending' in section_lower or 'outro' in section_lower:
+            return 69  # Dark purple
+        elif 'intro' in section_lower:
+            return 58  # Cyan
+        elif 'interlude' in section_lower or 'inter' in section_lower:
+            return 66  # Teal
+        elif 'instrumental' in section_lower or 'inst' in section_lower:
+            return 66  # Teal
+        else:
+            return 58  # Default cyan
+
+    def _create_midi_clip_element(self, name: str, beat_position: float, duration: float, clip_id: int) -> ET.Element:
+        """Create a MidiClip by copying the template clip and modifying key fields.
         
-        # Loop configuration
-        loop = ET.SubElement(clip, "Loop")
-        loop_start = ET.SubElement(loop, "LoopStart")
-        loop_start.set('Value', '0')
-        loop_end = ET.SubElement(loop, "LoopEnd")
-        loop_end.set('Value', str(duration))
-        loop_on = ET.SubElement(loop, "LoopOn")
-        loop_on.set('Value', 'true')
-        out_marker = ET.SubElement(loop, "OutMarker")
-        out_marker.set('Value', str(duration))
-        hidden_loop_start = ET.SubElement(loop, "HiddenLoopStart")
-        hidden_loop_start.set('Value', '0')
-        hidden_loop_end = ET.SubElement(loop, "HiddenLoopEnd")
-        hidden_loop_end.set('Value', str(duration))
+        This approach mirrors manual workflow: copy a working clip, then rename it and adjust position.
+        """
+        if self.template_midi_clip is None:
+            logger.error("No template MidiClip available, cannot create clip")
+            return None
         
-        # Name
-        name_elem = ET.SubElement(clip, "Name")
-        name_elem.set('Value', name)
+        # Deep copy the template clip
+        clip = copy.deepcopy(self.template_midi_clip)
         
-        # Annotation
-        annotation = ET.SubElement(clip, "Annotation")
-        annotation.set('Value', '')
+        # Update the key attributes
+        beat_position_int = int(beat_position)
+        duration_int = int(duration)
         
-        # Color (17 = orange/yellow for arrangement markers)
-        color = ET.SubElement(clip, "Color")
-        color.set('Value', '17')
+        clip.set('Id', str(clip_id))
+        clip.set('Time', str(beat_position_int))
         
-        # Launch settings
-        launch_mode = ET.SubElement(clip, "LaunchMode")
-        launch_mode.set('Value', 'Clip')
-        launch_quantization = ET.SubElement(clip, "LaunchQuantisation")
-        launch_quantization.set('Value', 'Global')
+        # Update the name
+        name_elem = clip.find('Name')
+        if name_elem is not None:
+            name_elem.set('Value', name)
         
-        # Time Signature (4/4)
-        time_sig = ET.SubElement(clip, "TimeSignature")
-        remote_time_sig = ET.SubElement(time_sig, "RemoteableTimeSignature")
-        numerator = ET.SubElement(remote_time_sig, "Numerator")
-        numerator.set('Value', '4')
-        denominator = ET.SubElement(remote_time_sig, "Denominator")
-        denominator.set('Value', '4')
+        # Set color based on section type
+        color_code = self._get_clip_color(name)
+        color_elem = clip.find('Color')
+        if color_elem is not None:
+            color_elem.set('Value', str(color_code))
         
-        # Envelopes (empty)
-        envelopes = ET.SubElement(clip, "Envelopes")
-        envelopes.set('Envelopes', '')
+        # CRITICAL: Update CurrentStart to match Time (Ableton requires this)
+        # When you copy/paste a clip in Ableton, CurrentStart always equals Time
+        current_start = clip.find('CurrentStart')
+        if current_start is not None:
+            current_start.set('Value', str(beat_position_int))
         
-        # ScrollerTimePreserver
-        scroller = ET.SubElement(clip, "ScrollerTimePreserver")
-        scroll_time = ET.SubElement(scroller, "Time")
-        scroll_time.set('Value', '0')
+        # Update CurrentEnd = Time + duration (the clip's actual duration on timeline)
+        current_end = clip.find('CurrentEnd')
+        if current_end is not None:
+            current_end.set('Value', str(beat_position_int + duration_int))
         
-        # TimeSelection
-        time_sel = ET.SubElement(clip, "TimeSelection")
-        time_sel_start = ET.SubElement(time_sel, "StartTime")
-        time_sel_start.set('Value', '0')
-        time_sel_end = ET.SubElement(time_sel, "EndTime")
-        time_sel_end.set('Value', str(duration))
+        # Log what we're setting for this clip
+        logger.debug(f"Creating clip '{name}': beat_position={beat_position_int}, duration={duration_int}")
+        logger.debug(f"  Set CurrentStart={beat_position_int}, CurrentEnd={beat_position_int + duration_int}")
         
-        # Legato
-        legato = ET.SubElement(clip, "Legato")
-        legato.set('Value', 'false')
-        
-        # Ram
-        ram = ET.SubElement(clip, "Ram")
-        ram.set('Value', 'false')
-        
-        # GrooveSettings
-        groove = ET.SubElement(clip, "GrooveSettings")
-        groove_override = ET.SubElement(groove, "GrooveOverride")
-        groove_override.set('Value', 'false')
-        groove_amount = ET.SubElement(groove, "Amount")
-        groove_amount.set('Value', '1')
-        
-        # Grid
-        grid = ET.SubElement(clip, "Grid")
-        grid_fixed_num = ET.SubElement(grid, "FixedNumerator")
-        grid_fixed_num.set('Value', '4')
-        grid_fixed_denom = ET.SubElement(grid, "FixedDenominator")
-        grid_fixed_denom.set('Value', '4')
-        grid_interval = ET.SubElement(grid, "GridIntervalPixel")
-        grid_interval.set('Value', '20')
-        grid_ntoles = ET.SubElement(grid, "Ntoles")
-        grid_ntoles.set('Value', '1')
-        grid_snap = ET.SubElement(grid, "SnapToGrid")
-        grid_snap.set('Value', 'true')
-        grid_fixed = ET.SubElement(grid, "Fixed")
-        grid_fixed.set('Value', 'false')
-        
-        # Freeze settings
-        freeze_start = ET.SubElement(clip, "FreezeStart")
-        freeze_start.set('Value', '0')
-        freeze_end = ET.SubElement(clip, "FreezeEnd")
-        freeze_end.set('Value', '0')
-        is_warped = ET.SubElement(clip, "IsWarped")
-        is_warped.set('Value', 'false')
-        
-        # Take ID
-        take_id = ET.SubElement(clip, "TakeId")
-        take_id.set('Value', '0')
-        
-        # Notes section (empty but required)
-        notes = ET.SubElement(clip, "Notes")
-        key_tracks = ET.SubElement(notes, "KeyTracks")
-        per_note_store = ET.SubElement(notes, "PerNoteEventStore")
-        event_lists = ET.SubElement(notes, "EventLists")
-        note_id_gen = ET.SubElement(notes, "NoteIdGenerator")
-        note_id_gen.set('Value', '0')
-        
-        # MIDI settings
-        bank_select_coarse = ET.SubElement(clip, "BankSelectCoarse")
-        bank_select_coarse.set('Value', '-1')
-        bank_select_fine = ET.SubElement(clip, "BankSelectFine")
-        bank_select_fine.set('Value', '-1')
-        program_change = ET.SubElement(clip, "ProgramChange")
-        program_change.set('Value', '-1')
-        
-        # Note editor settings
-        note_ed_fold_in_zoom = ET.SubElement(clip, "NoteEditorFoldInZoom")
-        note_ed_fold_in_zoom.set('Value', '-1')
-        note_ed_fold_in_scroll = ET.SubElement(clip, "NoteEditorFoldInScroll")
-        note_ed_fold_in_scroll.set('Value', '-1')
-        note_ed_fold_out_zoom = ET.SubElement(clip, "NoteEditorFoldOutZoom")
-        note_ed_fold_out_zoom.set('Value', '-1')
-        note_ed_fold_out_scroll = ET.SubElement(clip, "NoteEditorFoldOutScroll")
-        note_ed_fold_out_scroll.set('Value', '-1')
-        
-        # Scale information
-        scale_info = ET.SubElement(clip, "ScaleInformation")
-        root_note = ET.SubElement(scale_info, "RootNote")
-        root_note.set('Value', '0')
-        scale_name = ET.SubElement(scale_info, "Name")
-        scale_name.set('Value', 'Major')
-        
-        # In key settings
-        is_in_key = ET.SubElement(clip, "IsInKey")
-        is_in_key.set('Value', 'false')
-        note_spelling_pref = ET.SubElement(clip, "NoteSpellingPreference")
-        note_spelling_pref.set('Value', 'Flats')
-        prefer_flat_root = ET.SubElement(clip, "PreferFlatRootNote")
-        prefer_flat_root.set('Value', 'false')
-        
-        # Follow action (disabled)
-        follow_action = ET.SubElement(clip, "FollowAction")
-        follow_time = ET.SubElement(follow_action, "FollowTime")
-        follow_time.set('Value', '1')
-        is_linked = ET.SubElement(follow_action, "IsLinked")
-        is_linked.set('Value', 'false')
-        loop_iterations = ET.SubElement(follow_action, "LoopIterations")
-        loop_iterations.set('Value', '-1')
-        follow_action_a = ET.SubElement(follow_action, "FollowActionA")
-        follow_action_a.set('Value', 'Stop')
-        follow_action_b = ET.SubElement(follow_action, "FollowActionB")
-        follow_action_b.set('Value', 'Stop')
-        
-        # Expression grid
-        expr_grid = ET.SubElement(clip, "ExpressionGrid")
-        expr_fixed_num = ET.SubElement(expr_grid, "FixedNumerator")
-        expr_fixed_num.set('Value', '4')
-        expr_fixed_denom = ET.SubElement(expr_grid, "FixedDenominator")
-        expr_fixed_denom.set('Value', '4')
-        expr_interval = ET.SubElement(expr_grid, "GridIntervalPixel")
-        expr_interval.set('Value', '20')
+        # Update Loop fields (these appear to have longer durations, likely from template)
+        # Keep these as relative loop boundaries, not absolute timeline positions
+        for elem in clip.iter():
+            # For Loop/HiddenLoopEnd (this stays relative to loop, not timeline)
+            if elem.tag == 'Loop':
+                for child in elem:
+                    if child.tag == 'HiddenLoopEnd':
+                        child.set('Value', str(duration_int))
+                        logger.debug(f"  Set HiddenLoopEnd={duration_int}")
+            
+            # For TimeSelection/EndTime
+            if elem.tag == 'TimeSelection':
+                for child in elem:
+                    if child.tag == 'EndTime':
+                        child.set('Value', str(duration_int))
         
         return clip
 
-    def _generate_output_path(self, service_title: str) -> Path:
-        """Generate output path for the new project file."""
-        # Sanitize service title for filename
-        safe_title = "".join(c for c in service_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_title = safe_title.replace(' ', '_')
 
-        filename = f"{safe_title}.als"
-        return self.output_folder / filename
 
-    def _save_project(self, tree: ET.ElementTree, output_path: Path) -> None:
-        """Save the modified project as a proper .als file.
+    def _generate_output_path(self, service_type_name: str, service_date) -> Path:
+        """Generate the output path for the .als file.
         
-        For gzip format: Writes XML with proper declaration and compresses.
-        For ZIP format: Extracts, modifies, and re-zips.
+        Format: Service_Type YYYY-MM-DD.als
+        Example: SMC Weekend Services 2026-04-26.als
+        
+        File goes directly to: /output_folder/Service_Type YYYY-MM-DD.als
+        """
+        # Clean service type name (keep spaces but remove special chars)
+        safe_title = "".join(c for c in service_type_name if c.isalnum() or c in (' ', '-')).rstrip()
+        
+        # Format date as YYYY-MM-DD
+        date_str = service_date.strftime("%Y-%m-%d")
+        
+        # Create filename: "Service Type YYYY-MM-DD.als"
+        als_filename = f"{safe_title} {date_str}.als"
+        als_file_path = self.output_folder / als_filename
+        
+        return als_file_path
+
+    def _save_project(self, tree: ET.ElementTree, als_file_path: Path) -> None:
+        """Save the modified project as a .als file.
+        
+        Creates: /output_folder/Service_Type YYYY-MM-DD.als (gzip-compressed XML)
         """
         try:
+            # Create output folder if it doesn't exist
+            als_file_path.parent.mkdir(parents=True, exist_ok=True)
+            
             # Convert the modified XML tree to string WITH the XML declaration
             xml_string = ET.tostring(tree.getroot(), encoding='unicode')
             
@@ -711,7 +897,7 @@ class AbletonService:
 
             if self.template_format == 'gzip':
                 # For gzip: Write XML with proper headers and compression
-                with gzip.GzipFile(output_path, 'wb', compresslevel=9, mtime=0) as f:
+                with gzip.GzipFile(als_file_path, 'wb', compresslevel=9, mtime=0) as f:
                     f.write(xml_content)
                 logger.debug(f"Saved project as gzip format with XML declaration")
 
@@ -746,8 +932,8 @@ class AbletonService:
                             f.write(xml_content)
                         logger.debug(f"Updated {project_xml_path} in temporary directory")
 
-                    # Create the output ZIP file
-                    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
+                    # Create the output ZIP file inside the project folder
+                    with zipfile.ZipFile(als_file_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
                         # Walk through the temporary directory and add all files
                         for root_dir, dirs, files in os.walk(temp_dir_path):
                             for file in files:
@@ -759,10 +945,10 @@ class AbletonService:
             else:
                 # Default to gzip if format is unknown
                 logger.warning("Template format unknown, defaulting to gzip")
-                with gzip.GzipFile(output_path, 'wb', compresslevel=9, mtime=0) as f:
+                with gzip.GzipFile(als_file_path, 'wb', compresslevel=9, mtime=0) as f:
                     f.write(xml_content)
 
-            logger.info(f"Project saved to: {output_path}")
+            logger.info(f"Project file saved to: {als_file_path}")
 
         except Exception as e:
             logger.error(f"Failed to save project: {e}")
