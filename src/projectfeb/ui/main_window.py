@@ -414,10 +414,15 @@ class ProjectFEBApp:
             return
 
         try:
+            # Get service type name and plan date for proper naming
+            service_type_name = self.selected_service_type.name if self.selected_service_type else "Service"
+            service_date = self.selected_plan.date
+            
             output_path = self.ableton_service.generate_setlist(
-                self.selected_plan.title,
-                self.stem_matches,
-                self.selected_plan.songs
+                service_type_name=service_type_name,
+                service_date=service_date,
+                stem_matches=self.stem_matches,
+                plan_songs=self.selected_plan.songs
             )
 
             if output_path:
