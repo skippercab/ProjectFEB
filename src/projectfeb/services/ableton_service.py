@@ -329,7 +329,7 @@ class AbletonService:
         logger.debug(f"Added locator: {song_title} at beat {time_position} with ID {locator_id}")
 
     def _add_guides_and_midi_clips(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: List) -> None:
-        """Add guide stems to track 3 and create MIDI clips with arrangement sequence."""
+        """Add guide stems to track 3, create guide audio tracks, and create MIDI clips with arrangement sequence."""
         # Get locators to find song start positions
         locators_map = self._get_locators_map(liveset)
         
@@ -380,6 +380,12 @@ class AbletonService:
                     self._add_guide_stem_to_track(tracks, guide_track_idx, guide_stems[0], song_start_beat)
                 else:
                     logger.debug(f"No guide stem found for '{song.title}'")
+            
+            # Add guide .wav audio files on new audio tracks
+            guide_wav_stems = [s for s in stem_match.stems if s.stem_type == 'guide' and s.path.suffix.lower() == '.wav']
+            if guide_wav_stems:
+                logger.info(f"Adding {len(guide_wav_stems)} guide .wav file(s) for '{song.title}'")
+                self._add_guide_audio_tracks(tracks, guide_wav_stems, song.title, song_start_beat)
             
             # Add MIDI clips with arrangement sequence
             if midi_track_idx is not None and song.arrangement and song.arrangement.sequence:
@@ -687,6 +693,106 @@ class AbletonService:
         path_elem.set('Value', str(guide_stem.path))
         
         logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track (slot {slot_id})")
+
+    def _add_guide_audio_tracks(self, tracks: ET.Element, guide_wav_stems: List[AudioStem], song_title: str, beat_position: float) -> None:
+        """Create new audio tracks for Guide .wav files and add them starting at beat_position."""
+        # Find a template audio track to use as a base
+        audio_tracks = tracks.findall(".//AudioTrack")
+        if not audio_tracks:
+            logger.error("No existing audio tracks found to use as template")
+            return
+        
+        template_track = audio_tracks[0]  # Use first audio track as template
+        
+        # Get the highest track ID in use
+        all_tracks = tracks.findall(".//*/[@Id]")
+        max_id = 0
+        for track in all_tracks:
+            try:
+                track_id = int(track.get('Id', '0'))
+                max_id = max(max_id, track_id)
+            except ValueError:
+                pass
+        
+        # Create a new audio track for each guide .wav file
+        for wav_idx, guide_wav in enumerate(guide_wav_stems):
+            try:
+                # Deep copy the template track
+                new_track = copy.deepcopy(template_track)
+                
+                # Assign a new unique ID
+                new_id = max_id + 100 + wav_idx
+                new_track.set('Id', str(new_id))
+                
+                # Set the track name to include song title and "Guide"
+                name_elem = new_track.find(".//Name/EffectiveName")
+                if name_elem is not None:
+                    name_elem.set('Value', f"{song_title} - Guide")
+                else:
+                    # If EffectiveName doesn't exist, try to find/create Name
+                    name_wrapper = new_track.find(".//Name")
+                    if name_wrapper is not None:
+                        eff_name = ET.SubElement(name_wrapper, "EffectiveName")
+                        eff_name.set('Value', f"{song_title} - Guide")
+                
+                # Clear out any existing clips from the new track
+                clip_slots_wrapper = new_track.find(".//ClipSlotsListWrapper")
+                if clip_slots_wrapper is not None:
+                    # Remove any children to make it empty
+                    for child in list(clip_slots_wrapper):
+                        clip_slots_wrapper.remove(child)
+                
+                # Add the audio clip with the guide .wav file
+                clip_slot_list = ET.SubElement(clip_slots_wrapper, "ClipSlotList")
+                clip_slot = ET.SubElement(clip_slot_list, "ClipSlot")
+                clip_slot.set('Id', '0')
+                
+                # Create AudioClip element
+                audio_clip = ET.SubElement(clip_slot, "AudioClip")
+                audio_clip.set('Id', '0')
+                audio_clip.set('Time', str(int(beat_position)))
+                
+                # Basic audio clip properties
+                lom_id = ET.SubElement(audio_clip, "LomId")
+                lom_id.set('Value', '0')
+                
+                name = ET.SubElement(audio_clip, "Name")
+                name.set('Value', guide_wav.filename)
+                
+                annotation = ET.SubElement(audio_clip, "Annotation")
+                annotation.set('Value', '')
+                
+                color = ET.SubElement(audio_clip, "Color")
+                color.set('Value', '13')  # Light gray/neutral color
+                
+                # File reference for the guide .wav file
+                sample = ET.SubElement(audio_clip, "Sample")
+                file_ref = ET.SubElement(sample, "FileRef")
+                file_ref.set('Source', 'Absolute')
+                
+                path_elem = ET.SubElement(file_ref, "Path")
+                path_elem.set('Value', str(guide_wav.path))
+                
+                # Append the new track to the tracks list
+                # Find the position after audio tracks
+                first_midi_idx = None
+                children = list(tracks)
+                
+                for i, child in enumerate(children):
+                    if child.tag == 'MidiTrack':
+                        first_midi_idx = i
+                        break
+                
+                if first_midi_idx is not None:
+                    tracks.insert(first_midi_idx, new_track)
+                else:
+                    tracks.append(new_track)
+                
+                logger.info(f"Created new guide audio track '{song_title} - Guide' with ID {new_id} at beat {beat_position}")
+                logger.info(f"Added audio clip: {guide_wav.filename} to new guide track")
+                
+            except Exception as e:
+                logger.error(f"Failed to create guide audio track for '{song_title}': {e}")
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips in ArrangerAutomation/Events for arrangement playback."""
