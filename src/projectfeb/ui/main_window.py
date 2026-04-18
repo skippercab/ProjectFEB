@@ -541,6 +541,10 @@ class ProjectFEBApp:
         # Reload folders after settings are potentially changed
         self._load_folders()
 
+    def run(self):
+        """Run the application main loop."""
+        self.root.mainloop()
+
 
 class SettingsDialog:
     """Settings dialog for configuring the application."""
@@ -834,7 +838,3 @@ class SettingsDialog:
                 "Connection Failed",
                 f"Failed to connect to Planning Center Online:\n{str(e)}"
             )
-
-    def run(self):
-        """Run the application main loop."""
-        self.root.mainloop()
