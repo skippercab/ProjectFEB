@@ -2,6 +2,7 @@
 
 import gzip
 import zipfile
+import wave
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -11,8 +12,11 @@ import shutil
 import tempfile
 import os
 import copy
+import zlib
 
 from ..core.config import AbletonConfig
+from ._audio_clip_template import create_audio_clip_template
+from ._blank_audio_track import create_blank_audio_track_template
 from .multitracks_service import AudioStem, StemMatch
 
 @dataclass
@@ -38,6 +42,8 @@ class AbletonService:
         self.output_folder = Path(config.output_folder) if config.output_folder else Path.home() / "Desktop"
         self.template_format = None  # Will be set to 'zip' or 'gzip' when loading template
         self.template_midi_clip = None  # Template MidiClip to use as base for copies
+        self.blank_audio_track_template = create_blank_audio_track_template()
+        self.audio_clip_template = create_audio_clip_template()
 
         # Ensure output folder exists
         self.output_folder.mkdir(parents=True, exist_ok=True)
@@ -72,11 +78,12 @@ class AbletonService:
             # Create a project title for the Ableton window from service type and date
             project_title = f"{service_type_name} {service_date.strftime('%Y-%m-%d')}"
             
-            # Modify the template with service data
-            self._populate_setlist(template_tree, project_title, stem_matches, plan_songs)
-
             # Save the new project file
             als_file_path = self._generate_output_path(service_type_name, service_date)
+
+            # Modify the template with service data
+            self._populate_setlist(template_tree, project_title, stem_matches, plan_songs, als_file_path)
+
             self._save_project(template_tree, als_file_path)
 
             logger.info(f"Generated setlist: {als_file_path}")
@@ -198,7 +205,14 @@ class AbletonService:
             if root.get('Creator'):
                 root.set('Creator', 'Ableton Live 11.3.43')
 
-    def _populate_setlist(self, tree: ET.ElementTree, service_title: str, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
+    def _populate_setlist(
+        self,
+        tree: ET.ElementTree,
+        service_title: str,
+        stem_matches: Dict[str, StemMatch],
+        plan_songs: Optional[List] = None,
+        als_file_path: Optional[Path] = None,
+    ) -> None:
         """Populate the template with service data - title, song markers, guides, and MIDI clips."""
         root = tree.getroot()
 
@@ -217,7 +231,7 @@ class AbletonService:
         
         # Add guide stems and MIDI clips for each song (if arrangement data available)
         if plan_songs:
-            self._add_guides_and_midi_clips(liveset, stem_matches, plan_songs)
+            self._add_guides_and_midi_clips(liveset, stem_matches, plan_songs, als_file_path)
             # Add tempo mapping for each song
             self._add_tempo_mapping(liveset, plan_songs)
 
@@ -328,8 +342,14 @@ class AbletonService:
 
         logger.debug(f"Added locator: {song_title} at beat {time_position} with ID {locator_id}")
 
-    def _add_guides_and_midi_clips(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: List) -> None:
-        """Add guide stems to track 3 and create MIDI clips with arrangement sequence."""
+    def _add_guides_and_midi_clips(
+        self,
+        liveset: ET.Element,
+        stem_matches: Dict[str, StemMatch],
+        plan_songs: List,
+        als_file_path: Optional[Path],
+    ) -> None:
+        """Add guide stems to existing track, create guide audio tracks for .wav files, and create MIDI clips with arrangement sequence."""
         # Get locators to find song start positions
         locators_map = self._get_locators_map(liveset)
         
@@ -348,7 +368,7 @@ class AbletonService:
         midi_track_idx = self._create_arrangement_track(tracks)
         
         if guide_track_idx is None:
-            logger.warning("Guide track not found")
+            logger.warning("Guide track not found, will create new audio tracks for guides")
         if midi_track_idx is None:
             logger.warning("Failed to create arrangement track")
         
@@ -372,12 +392,18 @@ class AbletonService:
             
             stem_match = stem_matches[song.title]
             
-            # Add guide stem to track 3
-            if guide_track_idx is not None:
-                guide_stems = [s for s in stem_match.stems if s.stem_type == 'guide']
-                if guide_stems:
-                    logger.info(f"Adding guide stem for '{song.title}' at beat {song_start_beat}")
-                    self._add_guide_stem_to_track(tracks, guide_track_idx, guide_stems[0], song_start_beat)
+            primary_guide_wav = self._select_primary_guide_wav(stem_match.stems)
+            if primary_guide_wav and als_file_path is not None:
+                logger.info(f"Adding guide wav for '{song.title}' at beat {song_start_beat}: {primary_guide_wav.filename}")
+                new_track = self._create_guide_audio_track(liveset, tracks, primary_guide_wav, song.title)
+                if new_track is not None:
+                    bpm = song.arrangement.bpm if song.arrangement and song.arrangement.bpm else 120
+                    self._add_audio_clip_to_track(new_track, primary_guide_wav, song_start_beat, bpm, als_file_path)
+            elif guide_track_idx is not None:
+                guide_stem = self._select_primary_guide_stem(stem_match.stems)
+                if guide_stem is not None:
+                    logger.info(f"Adding fallback guide stem for '{song.title}' at beat {song_start_beat}")
+                    self._add_guide_stem_to_track(tracks, guide_track_idx, guide_stem, song_start_beat)
                 else:
                     logger.debug(f"No guide stem found for '{song.title}'")
             
@@ -548,6 +574,299 @@ class AbletonService:
         
         return None
 
+    def _next_available_id(self, scope: ET.Element) -> int:
+        """Return the next available numeric Id within the given XML scope."""
+        max_id = 0
+        for elem in scope.iter():
+            elem_id = elem.get('Id')
+            if elem_id and elem_id.lstrip('-').isdigit():
+                max_id = max(max_id, int(elem_id))
+        return max_id + 1
+
+    def _get_audio_track_insert_index(self, tracks: ET.Element) -> int:
+        """Insert AudioTracks after existing AudioTracks or before the fixed track tail."""
+        children = list(tracks)
+
+        for index in range(len(children) - 1, -1, -1):
+            if children[index].tag == 'AudioTrack':
+                return index + 1
+
+        for index, child in enumerate(children):
+            if child.tag in {'ReturnTrack', 'MasterTrack', 'PreHearTrack'}:
+                return index
+
+        return len(children)
+
+    def _get_template_send_count(self, tracks: ET.Element) -> int:
+        """Use the template's current routing layout to size the new track sends."""
+        for child in tracks:
+            if child.tag not in {'AudioTrack', 'MidiTrack', 'GroupTrack'}:
+                continue
+
+            sends = child.find('.//Mixer/Sends')
+            if sends is None:
+                continue
+
+            send_holders = sends.findall('TrackSendHolder')
+            if send_holders:
+                return len(send_holders)
+
+        return len([child for child in tracks if child.tag == 'ReturnTrack'])
+
+    def _get_template_clip_slot_count(self, tracks: ET.Element) -> int:
+        """Use the template's session layout to size the new track clip slots."""
+        for child in tracks:
+            if child.tag not in {'AudioTrack', 'MidiTrack', 'GroupTrack'}:
+                continue
+
+            clip_slot_list = child.find('.//MainSequencer/ClipSlotList')
+            if clip_slot_list is None:
+                continue
+
+            clip_slots = clip_slot_list.findall('ClipSlot')
+            if clip_slots:
+                return len(clip_slots)
+
+        return 0
+
+    def _resize_track_sends(self, track: ET.Element, send_count: int) -> None:
+        """Resize the embedded blank track's send holders to match the template."""
+        sends = track.find('.//Mixer/Sends')
+        if sends is None:
+            return
+
+        send_holders = sends.findall('TrackSendHolder')
+        if not send_holders:
+            return
+
+        prototype = send_holders[-1]
+
+        while len(send_holders) > send_count:
+            sends.remove(send_holders.pop())
+
+        while len(send_holders) < send_count:
+            cloned_holder = copy.deepcopy(prototype)
+            sends.append(cloned_holder)
+            send_holders.append(cloned_holder)
+
+        for index, holder in enumerate(send_holders):
+            holder.set('Id', str(index))
+
+    def _resize_track_clip_slots(self, track: ET.Element, clip_slot_count: int) -> None:
+        """Resize the embedded blank track's session clip slots to match the template."""
+        clip_slot_list = track.find('.//MainSequencer/ClipSlotList')
+        if clip_slot_list is None:
+            return
+
+        clip_slots = clip_slot_list.findall('ClipSlot')
+        if not clip_slots:
+            return
+
+        prototype = clip_slots[-1]
+
+        while len(clip_slots) > clip_slot_count:
+            clip_slot_list.remove(clip_slots.pop())
+
+        while len(clip_slots) < clip_slot_count:
+            cloned_slot = copy.deepcopy(prototype)
+            clip_slot_list.append(cloned_slot)
+            clip_slots.append(cloned_slot)
+
+        for index, clip_slot in enumerate(clip_slots):
+            clip_slot.set('Id', str(index))
+
+    def _remap_audio_track_internal_ids(self, track: ET.Element, start_id: int) -> int:
+        """Remap global-style IDs inside the inserted blank audio track."""
+        remap_tags = {
+            'AutomationTarget',
+            'ModulationTarget',
+            'Pointee',
+            'VolumeModulationTarget',
+            'TranspositionModulationTarget',
+            'GrainSizeModulationTarget',
+            'FluxModulationTarget',
+            'SampleOffsetModulationTarget',
+        }
+        id_map: Dict[str, str] = {}
+        next_id = start_id
+
+        for elem in track.iter():
+            if elem is track or elem.tag not in remap_tags:
+                continue
+
+            old_id = elem.get('Id')
+            if not old_id or not old_id.lstrip('-').isdigit():
+                continue
+
+            if old_id not in id_map:
+                id_map[old_id] = str(next_id)
+                next_id += 1
+
+            elem.set('Id', id_map[old_id])
+
+        for elem in track.iter('PointeeId'):
+            old_value = elem.get('Value')
+            if old_value in id_map:
+                elem.set('Value', id_map[old_value])
+
+        return next_id
+
+    def _update_next_pointee_id(self, liveset: ET.Element) -> None:
+        """Keep LiveSet/NextPointeeId strictly above every pointee-style Id in the set."""
+        remap_tags = {
+            'AutomationTarget',
+            'ModulationTarget',
+            'Pointee',
+            'VolumeModulationTarget',
+            'TranspositionModulationTarget',
+            'GrainSizeModulationTarget',
+            'FluxModulationTarget',
+            'SampleOffsetModulationTarget',
+        }
+
+        max_pointee_id = 0
+        for elem in liveset.iter():
+            if elem.tag not in remap_tags:
+                continue
+
+            elem_id = elem.get('Id')
+            if elem_id and elem_id.isdigit():
+                max_pointee_id = max(max_pointee_id, int(elem_id))
+
+        next_pointee_elem = liveset.find('NextPointeeId')
+        if next_pointee_elem is None:
+            next_pointee_elem = ET.Element('NextPointeeId')
+            insert_index = 0
+            for index, child in enumerate(list(liveset)):
+                if child.tag in {'OverwriteProtectionNumber', 'LomId', 'LomIdView', 'Tracks'}:
+                    insert_index = index
+                    break
+            liveset.insert(insert_index, next_pointee_elem)
+
+        next_pointee_elem.set('Value', str(max_pointee_id + 1))
+
+    def _is_click_stem(self, stem: AudioStem) -> bool:
+        """Identify click-like guide files so they do not create duplicate guide tracks."""
+        filename = stem.filename.lower()
+        return 'click' in filename or filename.startswith('classic-')
+
+    def _select_primary_guide_stem(self, stems: List[AudioStem]) -> Optional[AudioStem]:
+        """Prefer an actual guide file over click/cue variants."""
+        guide_stems = [stem for stem in stems if stem.stem_type == 'guide']
+        if not guide_stems:
+            return None
+
+        def score(stem: AudioStem) -> tuple[int, str]:
+            filename = stem.filename.lower()
+            if 'guide' in filename:
+                return (0, filename)
+            if 'cue' in filename or 'reference' in filename:
+                return (1, filename)
+            if self._is_click_stem(stem):
+                return (2, filename)
+            return (3, filename)
+
+        return sorted(guide_stems, key=score)[0]
+
+    def _select_primary_guide_wav(self, stems: List[AudioStem]) -> Optional[AudioStem]:
+        """Select one guide WAV per song, preferring GUIDE over CLICK."""
+        guide_wavs = [stem for stem in stems if stem.stem_type == 'guide' and stem.path.suffix.lower() == '.wav']
+        if not guide_wavs:
+            return None
+
+        preferred = self._select_primary_guide_stem(guide_wavs)
+        if preferred is None:
+            return None
+
+        logger.debug(f"Selected guide wav '{preferred.filename}' for song '{preferred.song_title}'")
+        return preferred
+
+    def _get_wav_metadata(self, wav_path: Path) -> tuple[int, int, float]:
+        """Return frame count, sample rate, and duration seconds for a WAV file."""
+        with wave.open(str(wav_path), 'rb') as wav_file:
+            frame_count = wav_file.getnframes()
+            sample_rate = wav_file.getframerate()
+        duration_seconds = frame_count / sample_rate if sample_rate else 0.0
+        return frame_count, sample_rate, duration_seconds
+
+    def _create_audio_clip_element(
+        self,
+        guide_wav: AudioStem,
+        beat_position: float,
+        bpm: float,
+        als_file_path: Path,
+    ) -> ET.Element:
+        """Create an Ableton-style AudioClip element for a guide WAV."""
+        clip = copy.deepcopy(self.audio_clip_template)
+
+        frame_count, sample_rate, duration_seconds = self._get_wav_metadata(guide_wav.path)
+        duration_beats = (duration_seconds * bpm / 60.0) if bpm else 0.0
+        clip_end_beat = beat_position + duration_beats
+        relative_path = os.path.relpath(guide_wav.path, als_file_path.parent).replace(os.sep, '/')
+        file_stat = guide_wav.path.stat()
+        file_crc = 0
+        with open(guide_wav.path, 'rb') as audio_file:
+            file_crc = zlib.crc32(audio_file.read()) & 0xFFFFFFFF
+
+        clip.set('Time', str(beat_position))
+
+        updates = {
+            'CurrentStart': beat_position,
+            'CurrentEnd': clip_end_beat,
+            'Loop/LoopStart': 0,
+            'Loop/LoopEnd': duration_beats,
+            'Loop/StartRelative': 0,
+            'Loop/OutMarker': duration_beats,
+            'Loop/HiddenLoopStart': 0,
+            'Loop/HiddenLoopEnd': duration_beats,
+            'Name': guide_wav.filename,
+            'ScrollerTimePreserver/LeftTime': 0,
+            'ScrollerTimePreserver/RightTime': duration_beats,
+            'SampleRef/FileRef/RelativePath': relative_path,
+            'SampleRef/FileRef/Path': str(guide_wav.path),
+            'SampleRef/FileRef/OriginalFileSize': file_stat.st_size,
+            'SampleRef/FileRef/OriginalCrc': file_crc,
+            'SampleRef/LastModDate': int(file_stat.st_mtime),
+            'SampleRef/DefaultDuration': frame_count,
+            'SampleRef/DefaultSampleRate': sample_rate,
+        }
+
+        for path, value in updates.items():
+            target = clip.find(path)
+            if target is not None:
+                target.set('Value', str(value))
+
+        warp_markers = clip.find('WarpMarkers')
+        if warp_markers is not None:
+            markers = warp_markers.findall('WarpMarker')
+            if len(markers) >= 3:
+                markers[1].set('SecTime', str(duration_seconds))
+                markers[2].set('SecTime', str(duration_seconds))
+                markers[1].set('BeatTime', str(duration_beats))
+                markers[2].set('BeatTime', str(duration_beats + 0.03125))
+
+        return clip
+
+    def _add_audio_clip_to_track(
+        self,
+        track: ET.Element,
+        guide_wav: AudioStem,
+        beat_position: float,
+        bpm: float,
+        als_file_path: Path,
+    ) -> None:
+        """Add an arranger audio clip to a blank guide audio track."""
+        events = track.find('.//MainSequencer/Sample/ArrangerAutomation/Events')
+        if events is None:
+            logger.error("MainSequencer Sample ArrangerAutomation Events not found in guide track")
+            return
+
+        clip = self._create_audio_clip_element(guide_wav, beat_position, bpm, als_file_path)
+        existing_ids = [int(existing.get('Id', '0')) for existing in events.findall('AudioClip') if existing.get('Id', '0').isdigit()]
+        clip.set('Id', str(max(existing_ids, default=0) + 1))
+        events.append(clip)
+        logger.info(f"Added guide wav clip '{guide_wav.filename}' at beat {beat_position} to track '{track.find('Name/EffectiveName').get('Value', '')}'")
+
     def _create_arrangement_track(self, tracks: ET.Element) -> Optional[int]:
         """Create a brand new MIDI track at the top for arrangement clips.
         
@@ -687,6 +1006,52 @@ class AbletonService:
         path_elem.set('Value', str(guide_stem.path))
         
         logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track (slot {slot_id})")
+
+    def _create_guide_audio_track(self, liveset: ET.Element, tracks: ET.Element, guide_wav: AudioStem, song_title: str) -> Optional[ET.Element]:
+        """Create a new blank audio track without depending on the current template's tracks."""
+        try:
+            new_track = copy.deepcopy(self.blank_audio_track_template)
+            next_id = self._next_available_id(liveset)
+            new_track.set('Id', str(next_id))
+            next_id += 1
+
+            self._resize_track_sends(new_track, self._get_template_send_count(tracks))
+
+            clip_slot_count = self._get_template_clip_slot_count(tracks)
+            if clip_slot_count > 0:
+                self._resize_track_clip_slots(new_track, clip_slot_count)
+
+            next_id = self._remap_audio_track_internal_ids(new_track, next_id)
+
+            track_name = f"{song_title} - Guide"
+            name_elem = new_track.find('Name')
+            if name_elem is not None:
+                effective_name = name_elem.find('EffectiveName')
+                if effective_name is not None:
+                    effective_name.set('Value', track_name)
+
+                user_name = name_elem.find('UserName')
+                if user_name is not None:
+                    user_name.set('Value', track_name)
+
+            color_elem = new_track.find('Color')
+            if color_elem is not None:
+                color_elem.set('Value', '13')
+
+            for selected_elem in new_track.iter('IsContentSelectedInDocument'):
+                selected_elem.set('Value', 'false')
+
+            tracks.insert(self._get_audio_track_insert_index(tracks), new_track)
+            self._update_next_pointee_id(liveset)
+
+            logger.info(
+                f"Created blank guide audio track ID={new_track.get('Id')} '{track_name}' for {guide_wav.filename}"
+            )
+            return new_track
+
+        except Exception as e:
+            logger.error(f"Failed to create guide audio track for '{song_title}': {e}", exc_info=True)
+            return None
 
     def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
         """Create MIDI clips in ArrangerAutomation/Events for arrangement playback."""
