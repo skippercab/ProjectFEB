@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox
 from pathlib import Path
 from typing import Optional, Dict
 from loguru import logger
+import time
 
 from ..core.config import Config
 from ..services.pco_service import (
@@ -313,9 +314,15 @@ class ProjectFEBApp:
             return
 
         try:
+            start_time = time.time()
+            logger.info(f"Starting to load plans for service type: {self.selected_service_type.name}")
+            
+            api_start = time.time()
             self.service_plans = self.pco_service.get_plans_for_service_type(
                 self.selected_service_type.id
             )
+            api_time = time.time() - api_start
+            logger.info(f"API call took {api_time:.2f} seconds to fetch {len(self.service_plans) if self.service_plans else 0} plans")
 
             if not self.service_plans:
                 self.service_combo.configure(values=["No plans found"])
@@ -324,17 +331,26 @@ class ProjectFEBApp:
                 return
 
             # Format plan names for display
+            format_start = time.time()
             plan_names = []
             for plan in self.service_plans:
                 date_str = plan.date.strftime("%Y-%m-%d")
                 display_name = f"{date_str} - {plan.title}"
                 plan_names.append(display_name)
+            format_time = time.time() - format_start
+            logger.info(f"Formatting plan names took {format_time:.2f} seconds")
 
+            ui_start = time.time()
             self.service_combo.configure(values=plan_names)
             # Don't automatically select the first plan - let the user choose
             # This prevents expensive stem matching until a plan is actually selected
             self.results_text.delete("0.0", "end")
             self.results_text.insert("0.0", "Select a service plan from the dropdown above to begin matching stems.")
+            ui_time = time.time() - ui_start
+            logger.info(f"UI update took {ui_time:.2f} seconds")
+            
+            total_time = time.time() - start_time
+            logger.info(f"Total _load_service_plans_for_service_type took {total_time:.2f} seconds")
 
         except Exception as e:
             logger.error(f"Failed to load service plans: {e}")
@@ -353,7 +369,30 @@ class ProjectFEBApp:
                 break
 
         if self.selected_plan:
+            # Fetch songs for this plan if not already fetched
+            if not self.selected_plan.songs and self.selected_service_type:
+                self._fetch_plan_songs()
+            else:
+                self._match_stems_for_plan()
+
+    def _fetch_plan_songs(self):
+        """Fetch songs for the selected plan (deferred until plan is selected)."""
+        if not self.selected_plan or not self.selected_service_type:
+            return
+        
+        try:
+            fetch_start = time.time()
+            logger.info(f"Starting to fetch songs for plan: {self.selected_plan.title}")
+            
+            self.pco_service._populate_plan_songs(self.selected_plan, self.selected_service_type.id)
+            
+            fetch_time = time.time() - fetch_start
+            logger.info(f"Fetching plan songs took {fetch_time:.2f} seconds for {len(self.selected_plan.songs)} songs")
+            
             self._match_stems_for_plan()
+        except Exception as e:
+            logger.error(f"Failed to fetch plan songs: {e}")
+            messagebox.showerror("Error", f"Failed to fetch plan songs:\n{str(e)}")
 
     def _match_stems_for_plan(self):
         """Match stems for the selected service plan."""

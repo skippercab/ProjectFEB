@@ -295,7 +295,8 @@ class PlanningCenterService:
 
             plans = []
             for plan_data in data.get('data', []):
-                plan = self._parse_service_plan(plan_data)
+                # Use lightweight parsing - don't fetch songs yet
+                plan = self._parse_service_plan_lightweight(plan_data)
                 if plan:
                     plans.append(plan)
 
@@ -304,6 +305,42 @@ class PlanningCenterService:
         except Exception as e:
             logger.error(f"Failed to get plans for service type {service_type_id}: {e}")
             return []
+
+    def _parse_service_plan_lightweight(self, plan_data: Dict[str, Any]) -> Optional[PCOServicePlan]:
+        """Parse a service plan WITHOUT fetching songs (lightweight version for listing)."""
+        try:
+            attributes = plan_data.get('attributes', {})
+            relationships = plan_data.get('relationships', {})
+
+            # Parse date
+            date_str = attributes.get('dates', attributes.get('date'))
+            if not date_str:
+                return None
+
+            plan_date = self._parse_date(date_str)
+            if not plan_date:
+                logger.warning(f"Could not parse date: {date_str}")
+                return None
+
+            # Create plan without songs - songs will be fetched when plan is selected
+            plan = PCOServicePlan(
+                id=plan_data['id'],
+                title=attributes.get('title', f"Service {plan_date.strftime('%Y-%m-%d')}"),
+                date=plan_date,
+                songs=[],  # Empty for now - will be populated when user selects this plan
+                service_type=relationships.get('service_type', {}).get('data', {}).get('id')
+            )
+
+            return plan
+
+        except Exception as e:
+            logger.error(f"Failed to parse service plan: {e}")
+            return None
+
+    def _populate_plan_songs(self, plan: PCOServicePlan, service_type_id: str) -> None:
+        """Populate songs for a plan (called when plan is actually selected)."""
+        songs = self._get_songs_from_plan(plan.id, service_type_id)
+        plan.songs = songs
 
     def _parse_service_plan(self, plan_data: Dict[str, Any]) -> Optional[PCOServicePlan]:
         """Parse a service plan from PCO API response."""
