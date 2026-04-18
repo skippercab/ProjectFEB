@@ -390,7 +390,7 @@ class AbletonService:
         return None
 
     def _add_guide_stem_to_track(self, tracks: ET.Element, track_idx: int, guide_stem: AudioStem, beat_position: float) -> None:
-        """Add a guide stem audio clip to the Guide track at specified beat position."""
+        """Add a guide stem audio clip to the Guide track, referencing the existing .wav file."""
         # Get all audio tracks
         audio_tracks = tracks.findall(".//AudioTrack")
         
@@ -429,7 +429,7 @@ class AbletonService:
         lom_id.set('Value', '0')
         
         name_elem = ET.SubElement(audio_clip, "Name")
-        name_elem.set('Value', f"Guide - {guide_stem.filename}")
+        name_elem.set('Value', guide_stem.filename)
         
         annotation = ET.SubElement(audio_clip, "Annotation")
         annotation.set('Value', '')
@@ -437,13 +437,14 @@ class AbletonService:
         color = ET.SubElement(audio_clip, "Color")
         color.set('Value', '47')  # Blue color
         
-        # Sample reference
+        # File reference for the guide stem (absolute path)
         sample = ET.SubElement(audio_clip, "Sample")
-        sample.set('Value', str(guide_stem.path))
+        file_ref = ET.SubElement(sample, "FileRef")
+        file_ref.set('Source', 'Absolute')
         
-        # Sample ref (pointer to file)
-        sample_ref = ET.SubElement(audio_clip, "SampleRef")
-        sample_ref.set('Value', str(guide_stem.path))
+        # Path to the guide stem file
+        path_elem = ET.SubElement(file_ref, "Path")
+        path_elem.set('Value', str(guide_stem.path))
         
         logger.info(f"Added audio clip: {guide_stem.filename} at beat {beat_position} to Guide track")
 
