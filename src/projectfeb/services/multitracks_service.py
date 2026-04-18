@@ -103,7 +103,10 @@ class MultitracksService:
         return matches
 
     def _discover_all_stems(self) -> List[AudioStem]:
-        """Discover all audio stems in the configured folder."""
+        """Discover all audio stems in the configured folder.
+        
+        Filters out .zip files and handles duplicate detection (folder vs .zip).
+        """
         stems = []
 
         if not self.stems_folder:
@@ -113,11 +116,38 @@ class MultitracksService:
         extensions = [f".{ext}" for ext in self.config.supported_formats]
 
         try:
-            # Iterate through song folders
-            for song_folder in self.stems_folder.iterdir():
-                if not song_folder.is_dir() or song_folder.name.startswith('.'):
-                    continue
-
+            # First pass: collect all items and detect duplicates
+            all_items = list(self.stems_folder.iterdir())
+            folders = [item for item in all_items if item.is_dir() and not item.name.startswith('.')]
+            zip_files = [item for item in all_items if item.is_file() and item.suffix.lower() == '.zip']
+            
+            # Detect duplicates: same base name, one folder and one .zip
+            zip_base_names = {item.stem for item in zip_files}
+            folder_names = {folder.name for folder in folders}
+            
+            duplicates = {}
+            for folder in folders:
+                if folder.name in zip_base_names:
+                    duplicates[folder.name] = {
+                        'folder': folder,
+                        'zip': next(z for z in zip_files if z.stem == folder.name)
+                    }
+            
+            # Handle duplicates - ask user which to use
+            folders_to_process = []
+            for folder in folders:
+                if folder.name in duplicates:
+                    # This is a duplicate - let the user choose
+                    chosen_path = self._resolve_duplicate(duplicates[folder.name])
+                    if chosen_path and chosen_path.is_dir():
+                        folders_to_process.append(chosen_path)
+                    logger.warning(f"Duplicate found for '{folder.name}': Using {'folder' if chosen_path == folder else 'zip (not expanded)'}")
+                else:
+                    # No duplicate, add normally
+                    folders_to_process.append(folder)
+            
+            # Process selected folders
+            for song_folder in folders_to_process:
                 # Extract clean song title from folder name
                 clean_title = self._extract_song_title_from_folder(song_folder.name)
 
@@ -125,12 +155,38 @@ class MultitracksService:
                 song_stems = self._find_stems_in_song_folder(song_folder, clean_title, extensions)
                 stems.extend(song_stems)
 
-            logger.info(f"Discovered {len(stems)} audio stem files across {len(list(self.stems_folder.iterdir()))} song folders")
+            logger.info(f"Discovered {len(stems)} audio stem files across {len(folders_to_process)} song folders")
+            if duplicates:
+                logger.warning(f"Skipped {len(duplicates)} .zip files that had matching folders")
             return stems
 
         except Exception as e:
             logger.error(f"Failed to discover stems: {e}")
             return []
+
+    def _resolve_duplicate(self, duplicate_dict: Dict) -> Optional[Path]:
+        """Resolve duplicate by preferring folder over .zip file.
+        
+        In the future, this could prompt the user via the UI.
+        For now, we prefer the folder (expanded) over the .zip file.
+        
+        Args:
+            duplicate_dict: Dict with 'folder' and 'zip' Path objects
+            
+        Returns:
+            The chosen Path (folder in this case)
+        """
+        folder = duplicate_dict['folder']
+        zip_file = duplicate_dict['zip']
+        
+        logger.warning(f"⚠️  Duplicate found: '{folder.name}' (folder) and '{zip_file.name}' (zip)")
+        logger.warning(f"   → Using the folder: {folder}")
+        logger.warning(f"   → Ignoring the zip file: {zip_file}")
+        
+        # Return the folder path
+        # In the future, this method could be enhanced to prompt the user
+        # via the UI (e.g., a dialog asking which to use)
+        return folder
 
     def _parse_stem_file(self, file_path: Path) -> Optional[AudioStem]:
         """Parse a stem file to extract song title and stem type."""
@@ -342,6 +398,7 @@ class MultitracksService:
         - "Give Me Jesus (UPPERROOM)"
         - "Mighty Name of Jesus"
         - "The Blood (75) [G] sw"
+        - "Same God (Db) [72.5] sw"  (with decimal tempo)
         """
         title = folder_name
 
@@ -353,8 +410,8 @@ class MultitracksService:
         # Remove tempo information in parentheses (75)
         title = re.sub(r'\s*\(\d+\)', '', title)
 
-        # Remove tempo information in brackets [115]
-        title = re.sub(r'\s*\[\d+\]', '', title)
+        # Remove tempo information in brackets [115] or [72.5] (with decimals)
+        title = re.sub(r'\s*\[[\d.]+\]', '', title)
 
         # Remove key information in brackets [A-G][b#]?[anything]
         title = re.sub(r'\s*\[[A-G][b#]?[\w]*\]', '', title)

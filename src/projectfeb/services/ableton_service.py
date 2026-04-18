@@ -1,12 +1,15 @@
 """Ableton Live project file generation and manipulation service."""
 
 import gzip
+import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from loguru import logger
 import shutil
+import tempfile
+import os
 
 from ..core.config import AbletonConfig
 from .multitracks_service import AudioStem, StemMatch
@@ -76,17 +79,40 @@ class AbletonService:
             return None
 
     def _load_template(self) -> Optional[ET.ElementTree]:
-        """Load and parse the Ableton template file."""
+        """Load and parse the Ableton template file from ZIP."""
         try:
-            with gzip.open(self.template_path, 'rb') as f:
+            with zipfile.ZipFile(self.template_path, 'r') as zip_file:
+                # List files in the ZIP
+                file_list = zip_file.namelist()
+                logger.debug(f"Files in template ZIP: {file_list}")
+
+                # Look for the main project file (usually Ableton/Project.xml)
+                project_xml_path = None
+                for file_path in file_list:
+                    if file_path.endswith('Project.xml'):
+                        project_xml_path = file_path
+                        break
+
+                if not project_xml_path:
+                    # Fallback: look for any .xml file
+                    for file_path in file_list:
+                        if file_path.endswith('.xml'):
+                            project_xml_path = file_path
+                            break
+
+                if not project_xml_path:
+                    logger.error("No Project.xml found in template")
+                    return None
+
                 # Read the XML content
-                content = f.read()
+                with zip_file.open(project_xml_path) as xml_file:
+                    content = xml_file.read()
 
             # Parse XML
             root = ET.fromstring(content)
             tree = ET.ElementTree(root)
 
-            logger.info("Template loaded successfully")
+            logger.info(f"Template loaded successfully from {project_xml_path}")
             return tree
 
         except Exception as e:
@@ -309,12 +335,53 @@ class AbletonService:
         return self.output_folder / filename
 
     def _save_project(self, tree: ET.ElementTree, output_path: Path) -> None:
-        """Save the modified project to disk."""
-        # Convert tree back to string
-        xml_content = ET.tostring(tree.getroot(), encoding='unicode')
+        """Save the modified project as a proper ZIP-based .als file."""
+        try:
+            # Convert the modified XML tree to string
+            xml_content = ET.tostring(tree.getroot(), encoding='utf-8')
 
-        # Compress and save
-        with gzip.open(output_path, 'wt', encoding='utf-8') as f:
-            f.write(xml_content)
+            # Create a temporary directory to work with
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_dir_path = Path(temp_dir)
 
-        logger.info(f"Project saved to: {output_path}")
+                # Copy the template ZIP structure
+                with zipfile.ZipFile(self.template_path, 'r') as template_zip:
+                    template_zip.extractall(temp_dir_path)
+
+                    # Find and replace the Project.xml file
+                    project_xml_path = None
+                    for file_path in template_zip.namelist():
+                        if file_path.endswith('Project.xml'):
+                            project_xml_path = file_path
+                            break
+
+                    if not project_xml_path:
+                        # Try to find any .xml file
+                        for file_path in template_zip.namelist():
+                            if file_path.endswith('.xml'):
+                                project_xml_path = file_path
+                                break
+
+                # Write the modified XML
+                if project_xml_path:
+                    xml_file_path = temp_dir_path / project_xml_path
+                    xml_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(xml_file_path, 'wb') as f:
+                        f.write(xml_content)
+                    logger.debug(f"Updated {project_xml_path} in temporary directory")
+
+                # Create the output ZIP file
+                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
+                    # Walk through the temporary directory and add all files
+                    for root_dir, dirs, files in os.walk(temp_dir_path):
+                        for file in files:
+                            file_path = Path(root_dir) / file
+                            arcname = file_path.relative_to(temp_dir_path)
+                            output_zip.write(file_path, arcname)
+                            logger.debug(f"Added {arcname} to output ZIP")
+
+            logger.info(f"Project saved to: {output_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save project: {e}")
+            raise
