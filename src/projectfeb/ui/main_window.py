@@ -5,6 +5,9 @@ from tkinter import filedialog, messagebox
 from pathlib import Path
 from typing import Optional, Dict
 from loguru import logger
+import time
+import json
+from dataclasses import asdict
 
 from ..core.config import Config
 from ..services.pco_service import (
@@ -37,6 +40,10 @@ class ProjectFEBApp:
         self.selected_service_type: Optional[PCOServiceType] = None
         self.selected_plan: Optional[PCOServicePlan] = None
         self.stem_matches: Dict[str, StemMatch] = {}
+
+        # Preferences file
+        self.preferences_path = Path(__file__).parent.parent.parent.parent / "config" / "preferences.json"
+        self.preferences = self._load_preferences()
 
         # Setup GUI
         ctk.set_appearance_mode("system")
@@ -178,6 +185,26 @@ class ProjectFEBApp:
         """Load initial data when the app starts."""
         self._load_folders()
 
+    def _load_preferences(self) -> Dict:
+        """Load user preferences from file."""
+        if self.preferences_path.exists():
+            try:
+                with open(self.preferences_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load preferences: {e}")
+        return {}
+
+    def _save_preferences(self):
+        """Save user preferences to file."""
+        try:
+            self.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.preferences_path, 'w') as f:
+                json.dump(self.preferences, f, indent=2)
+            logger.debug(f"Preferences saved: {self.preferences}")
+        except Exception as e:
+            logger.error(f"Failed to save preferences: {e}")
+
     def _load_folders(self):
         """Load folders from Planning Center Online."""
         try:
@@ -226,11 +253,21 @@ class ProjectFEBApp:
             self.folder_combo.configure(values=folder_names)
             logger.info(f"Step 5: Set combo box with {len(folder_names)} values")
             
-            # Set to first folder as default
-            if folder_names:
-                self.folder_combo.set(folder_names[0])
-                logger.info(f"Step 6: Set default selection to: {folder_names[0]}")
-                self._on_folder_selected(folder_names[0])
+            # Restore last selected folder if available
+            last_folder_id = self.preferences.get("last_folder_id")
+            default_folder_name = folder_names[0]
+            
+            if last_folder_id:
+                for folder in self.folders:
+                    if folder.id == last_folder_id:
+                        default_folder_name = f"{folder.name} (ID: {folder.id})"
+                        logger.info(f"Restoring last selected folder: {folder.name}")
+                        break
+            
+            if default_folder_name:
+                self.folder_combo.set(default_folder_name)
+                logger.info(f"Step 6: Set default selection to: {default_folder_name}")
+                self._on_folder_selected(default_folder_name)
             
             logger.info("=== COMPLETED _load_folders ===")
 
@@ -253,6 +290,10 @@ class ProjectFEBApp:
                 break
 
         if self.selected_folder:
+            # Save folder preference
+            self.preferences["last_folder_id"] = self.selected_folder.id
+            self._save_preferences()
+            
             self._load_service_types_for_folder()
         else:
             self.service_type_combo.configure(values=[])
@@ -281,9 +322,21 @@ class ProjectFEBApp:
             st_names = [st.name for st in self.service_types]
 
             self.service_type_combo.configure(values=st_names)
-            if st_names:
-                self.service_type_combo.set(st_names[0])
-                self._on_service_type_selected(st_names[0])
+            
+            # Restore last selected service type if available
+            last_service_type_id = self.preferences.get("last_service_type_id")
+            default_service_type = st_names[0] if st_names else None
+            
+            if last_service_type_id:
+                for st in self.service_types:
+                    if st.id == last_service_type_id:
+                        default_service_type = st.name
+                        logger.info(f"Restoring last selected service type: {st.name}")
+                        break
+            
+            if default_service_type:
+                self.service_type_combo.set(default_service_type)
+                self._on_service_type_selected(default_service_type)
 
         except Exception as e:
             logger.error(f"Failed to load service types: {e}")
@@ -303,6 +356,10 @@ class ProjectFEBApp:
                 break
 
         if self.selected_service_type:
+            # Save service type preference
+            self.preferences["last_service_type_id"] = self.selected_service_type.id
+            self._save_preferences()
+            
             self._load_service_plans_for_service_type()
         else:
             self.service_combo.configure(values=[])
@@ -313,9 +370,15 @@ class ProjectFEBApp:
             return
 
         try:
+            start_time = time.time()
+            logger.info(f"Starting to load plans for service type: {self.selected_service_type.name}")
+            
+            api_start = time.time()
             self.service_plans = self.pco_service.get_plans_for_service_type(
                 self.selected_service_type.id
             )
+            api_time = time.time() - api_start
+            logger.info(f"API call took {api_time:.2f} seconds to fetch {len(self.service_plans) if self.service_plans else 0} plans")
 
             if not self.service_plans:
                 self.service_combo.configure(values=["No plans found"])
@@ -324,16 +387,26 @@ class ProjectFEBApp:
                 return
 
             # Format plan names for display
+            format_start = time.time()
             plan_names = []
             for plan in self.service_plans:
                 date_str = plan.date.strftime("%Y-%m-%d")
                 display_name = f"{date_str} - {plan.title}"
                 plan_names.append(display_name)
+            format_time = time.time() - format_start
+            logger.info(f"Formatting plan names took {format_time:.2f} seconds")
 
+            ui_start = time.time()
             self.service_combo.configure(values=plan_names)
-            if plan_names:
-                self.service_combo.set(plan_names[0])
-                self._on_service_selected(plan_names[0])
+            # Don't automatically select the first plan - let the user choose
+            # This prevents expensive stem matching until a plan is actually selected
+            self.results_text.delete("0.0", "end")
+            self.results_text.insert("0.0", "Select a service plan from the dropdown above to begin matching stems.")
+            ui_time = time.time() - ui_start
+            logger.info(f"UI update took {ui_time:.2f} seconds")
+            
+            total_time = time.time() - start_time
+            logger.info(f"Total _load_service_plans_for_service_type took {total_time:.2f} seconds")
 
         except Exception as e:
             logger.error(f"Failed to load service plans: {e}")
@@ -352,7 +425,30 @@ class ProjectFEBApp:
                 break
 
         if self.selected_plan:
+            # Fetch songs for this plan if not already fetched
+            if not self.selected_plan.songs and self.selected_service_type:
+                self._fetch_plan_songs()
+            else:
+                self._match_stems_for_plan()
+
+    def _fetch_plan_songs(self):
+        """Fetch songs for the selected plan (deferred until plan is selected)."""
+        if not self.selected_plan or not self.selected_service_type:
+            return
+        
+        try:
+            fetch_start = time.time()
+            logger.info(f"Starting to fetch songs for plan: {self.selected_plan.title}")
+            
+            self.pco_service._populate_plan_songs(self.selected_plan, self.selected_service_type.id)
+            
+            fetch_time = time.time() - fetch_start
+            logger.info(f"Fetching plan songs took {fetch_time:.2f} seconds for {len(self.selected_plan.songs)} songs")
+            
             self._match_stems_for_plan()
+        except Exception as e:
+            logger.error(f"Failed to fetch plan songs: {e}")
+            messagebox.showerror("Error", f"Failed to fetch plan songs:\n{str(e)}")
 
     def _match_stems_for_plan(self):
         """Match stems for the selected service plan."""
@@ -439,9 +535,308 @@ class ProjectFEBApp:
 
     def _open_settings(self):
         """Open the settings dialog."""
-        # For now, just show a placeholder
-        messagebox.showinfo("Settings", "Settings dialog coming soon!\n\nFor now, edit config/settings.json manually.")
+        settings_window = SettingsDialog(self.root, self.config)
+        self.root.wait_window(settings_window.dialog)
+        
+        # Reload config from file and reinitialize services
+        config_path = Path(__file__).parent.parent.parent.parent / "config" / "settings.json"
+        self.config = Config(config_path)
+        
+        # Reinitialize services with updated config
+        self.pco_service = PlanningCenterService(self.config.planning_center)
+        self.multitracks_service = MultitracksService(self.config.multitracks)
+        self.ableton_service = AbletonService(self.config.ableton)
+        
+        # Reload folders after settings are potentially changed
+        self._load_folders()
 
     def run(self):
         """Run the application main loop."""
         self.root.mainloop()
+
+
+class SettingsDialog:
+    """Settings dialog for configuring the application."""
+    
+    def __init__(self, parent, config: Config):
+        """Initialize settings dialog.
+        
+        Args:
+            parent: Parent window
+            config: Application configuration to edit
+        """
+        self.config = config
+        self.config_path = Path(__file__).parent.parent.parent.parent / "config" / "settings.json"
+        
+        # Create dialog window
+        self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.title("Settings")
+        self.dialog.geometry("700x750")
+        self.dialog.resizable(True, True)
+        
+        # Make it modal
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        self._create_widgets()
+    
+    def _create_widgets(self):
+        """Create the settings dialog widgets."""
+        main_frame = ctk.CTkScrollableFrame(self.dialog)
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+        
+        # Title
+        title = ctk.CTkLabel(
+            main_frame,
+            text="Application Settings",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        title.pack(pady=(0, 20))
+        
+        # Planning Center Section
+        pc_frame = self._create_section(main_frame, "Planning Center Online")
+        
+        self.pco_app_id_entry = self._create_text_field(
+            pc_frame,
+            "Application ID:",
+            self.config.planning_center.application_id
+        )
+        
+        self.pco_secret_entry = self._create_text_field(
+            pc_frame,
+            "Secret:",
+            self.config.planning_center.secret,
+            show="*"
+        )
+        
+        # Multitracks Section
+        mt_frame = self._create_section(main_frame, "Multitracks")
+        
+        self.stems_folder_entry = self._create_file_field(
+            mt_frame,
+            "Stems Folder:",
+            self.config.multitracks.stems_folder,
+            is_directory=True
+        )
+        
+        # Ableton Section
+        ab_frame = self._create_section(main_frame, "Ableton Live")
+        
+        self.template_path_entry = self._create_file_field(
+            ab_frame,
+            "Template Path:",
+            self.config.ableton.template_path,
+            is_directory=False
+        )
+        
+        self.output_folder_entry = self._create_file_field(
+            ab_frame,
+            "Output Folder:",
+            self.config.ableton.output_folder,
+            is_directory=True
+        )
+        
+        # Action buttons
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=(20, 0))
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save Settings",
+            command=self._save_settings,
+            fg_color="green",
+            hover_color="dark green"
+        )
+        save_btn.pack(side="left", padx=(0, 10))
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=self.dialog.destroy
+        )
+        cancel_btn.pack(side="left")
+        
+        test_btn = ctk.CTkButton(
+            button_frame,
+            text="Test Connection",
+            command=self._test_connection
+        )
+        test_btn.pack(side="right")
+    
+    def _create_section(self, parent, title: str) -> ctk.CTkFrame:
+        """Create a settings section with a title."""
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.pack(fill="x", pady=(15, 0))
+        
+        title_label = ctk.CTkLabel(
+            frame,
+            text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#4da6ff"
+        )
+        title_label.pack(anchor="w", pady=(0, 10))
+        
+        content_frame = ctk.CTkFrame(frame)
+        content_frame.pack(fill="x", padx=15)
+        
+        return content_frame
+    
+    def _create_text_field(self, parent, label: str, value: str, show: str = None) -> ctk.CTkEntry:
+        """Create a text input field."""
+        label_widget = ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=11))
+        label_widget.pack(anchor="w", pady=(0, 3))
+        
+        entry = ctk.CTkEntry(parent, show=show)
+        entry.insert(0, value)
+        entry.pack(fill="x", pady=(0, 12))
+        
+        return entry
+    
+    def _create_file_field(self, parent, label: str, value: str, is_directory: bool = False) -> ctk.CTkFrame:
+        """Create a file/folder selection field."""
+        container = ctk.CTkFrame(parent, fg_color="transparent")
+        container.pack(fill="x", pady=(0, 12))
+        
+        label_widget = ctk.CTkLabel(container, text=label, font=ctk.CTkFont(size=11))
+        label_widget.pack(anchor="w", pady=(0, 3))
+        
+        input_frame = ctk.CTkFrame(container)
+        input_frame.pack(fill="x")
+        
+        entry = ctk.CTkEntry(input_frame)
+        entry.insert(0, value)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        
+        browse_btn = ctk.CTkButton(
+            input_frame,
+            text="Browse",
+            width=80,
+            command=lambda: self._browse_path(entry, is_directory)
+        )
+        browse_btn.pack(side="right")
+        
+        return entry
+    
+    def _browse_path(self, entry: ctk.CTkEntry, is_directory: bool):
+        """Open file/folder browser dialog."""
+        if is_directory:
+            path = filedialog.askdirectory(
+                title="Select Folder",
+                initialdir=entry.get() or str(Path.home())
+            )
+        else:
+            path = filedialog.askopenfilename(
+                title="Select File",
+                initialdir=entry.get() or str(Path.home()),
+                filetypes=[("All Files", "*.*"), ("ALS Files", "*.als")]
+            )
+        
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+    
+    def _save_settings(self):
+        """Save settings to configuration file."""
+        try:
+            # Update config objects with new values
+            self.config.planning_center.application_id = self.pco_app_id_entry.get().strip()
+            self.config.planning_center.secret = self.pco_secret_entry.get().strip()
+            self.config.multitracks.stems_folder = self.stems_folder_entry.get().strip()
+            self.config.ableton.template_path = self.template_path_entry.get().strip()
+            self.config.ableton.output_folder = self.output_folder_entry.get().strip()
+            
+            # Validate required fields
+            if not self.config.planning_center.application_id:
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Planning Center Application ID is required."
+                )
+                return
+            
+            if not self.config.planning_center.secret:
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Planning Center Secret is required."
+                )
+                return
+            
+            if self.config.multitracks.stems_folder and not Path(self.config.multitracks.stems_folder).exists():
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Multitracks stems folder does not exist."
+                )
+                return
+            
+            if self.config.ableton.template_path and not Path(self.config.ableton.template_path).exists():
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Ableton template file does not exist."
+                )
+                return
+            
+            if self.config.ableton.output_folder and not Path(self.config.ableton.output_folder).exists():
+                messagebox.showwarning(
+                    "Validation Error",
+                    "Ableton output folder does not exist."
+                )
+                return
+            
+            # Save to file
+            self.config.save(self.config_path)
+            
+            messagebox.showinfo(
+                "Success",
+                "Settings saved successfully!"
+            )
+            
+            logger.info("Settings saved successfully")
+            self.dialog.destroy()
+            
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}", exc_info=True)
+            messagebox.showerror(
+                "Error",
+                f"Failed to save settings:\n{str(e)}"
+            )
+    
+    def _test_connection(self):
+        """Test Planning Center Online connection."""
+        try:
+            app_id = self.pco_app_id_entry.get().strip()
+            secret = self.pco_secret_entry.get().strip()
+            
+            if not app_id or not secret:
+                messagebox.showwarning(
+                    "Missing Credentials",
+                    "Please enter both Application ID and Secret."
+                )
+                return
+            
+            # Create a temporary service to test connection
+            from ..services.pco_service import PlanningCenterService
+            from ..core.config import PlanningCenterConfig
+            
+            test_config = PlanningCenterConfig(
+                application_id=app_id,
+                secret=secret
+            )
+            test_service = PlanningCenterService(test_config)
+            folders = test_service.get_folders()
+            
+            if folders:
+                messagebox.showinfo(
+                    "Connection Successful",
+                    f"Successfully connected to Planning Center Online!\nFound {len(folders)} folders."
+                )
+            else:
+                messagebox.showwarning(
+                    "No Data",
+                    "Connected successfully but no folders found."
+                )
+            
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}", exc_info=True)
+            messagebox.showerror(
+                "Connection Failed",
+                f"Failed to connect to Planning Center Online:\n{str(e)}"
+            )
