@@ -9,7 +9,7 @@ import time
 import json
 from dataclasses import asdict
 
-from ..core.config import Config
+from ..core.config import Config, default_output_buses
 from ..services.pco_service import (
     PlanningCenterService, PCOServicePlan, PCOFolder, PCOServiceType
 )
@@ -557,6 +557,28 @@ class ProjectFEBApp:
 
 class SettingsDialog:
     """Settings dialog for configuring the application."""
+
+    ROUTING_TAG_OPTIONS = [
+        ('drums', 'Drums'),
+        ('percussion', 'Percussion'),
+        ('loops', 'Loops'),
+        ('perc', 'Perc'),
+        ('bass', 'Bass'),
+        ('lead_line', 'Lead Line'),
+        ('electric_guitar', 'Electric Gtr'),
+        ('acoustic_guitar', 'Acoustic Gtr'),
+        ('guitars', 'All Guitars'),
+        ('orchestra', 'Orchestra'),
+        ('strings', 'Strings'),
+        ('piano', 'Piano'),
+        ('synth', 'Synth'),
+        ('keys', 'Keys'),
+        ('lead_vocal', 'Lead Vocal'),
+        ('bgvs', 'BGVs'),
+        ('vocals', 'Vocals'),
+    ]
+    MONO_SLOT_VALUES = [str(index) for index in range(1, 9)]
+    STEREO_SLOT_VALUES = ['1', '3', '5', '7']
     
     def __init__(self, parent, config: Config):
         """Initialize settings dialog.
@@ -567,11 +589,13 @@ class SettingsDialog:
         """
         self.config = config
         self.config_path = Path(__file__).parent.parent.parent.parent / "config" / "settings.json"
+        self.content_bus_rows: list[dict] = []
+        self.special_bus_rows: dict[str, dict] = {}
         
         # Create dialog window
         self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Settings")
-        self.dialog.geometry("700x750")
+        self.dialog.geometry("860x980")
         self.dialog.resizable(True, True)
         
         # Make it modal
@@ -635,6 +659,23 @@ class SettingsDialog:
             self.config.ableton.output_folder,
             is_directory=True
         )
+
+        self.sub_master_switch = ctk.CTkSwitch(
+            ab_frame,
+            text="Enable internal Sub Master monitoring bus"
+        )
+        self.sub_master_switch.pack(anchor="w", pady=(0, 10))
+        if self.config.ableton.enable_sub_master:
+            self.sub_master_switch.select()
+        else:
+            self.sub_master_switch.deselect()
+
+        self.sub_master_name_entry = self._create_text_field(
+            ab_frame,
+            "Sub Master Bus Name:",
+            self.config.ableton.sub_master_bus_name,
+        )
+        self._create_output_bus_editor(ab_frame)
         
         # Action buttons
         button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
@@ -734,16 +775,285 @@ class SettingsDialog:
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
+
+    def _create_output_bus_editor(self, parent) -> None:
+        """Create a structured editor for logical Ableton bus layout."""
+        description = ctk.CTkLabel(
+            parent,
+            text=(
+                "Logical Output Buses: create content buses, then place Click and Guide wherever you want in the return order.\n"
+                "Content buses can use up to 6 total lanes. Stereo buses must start on 1, 3, 5, or 7."
+            ),
+            justify="left",
+            font=ctk.CTkFont(size=11)
+        )
+        description.pack(anchor="w", pady=(0, 8))
+
+        self.output_bus_summary_label = ctk.CTkLabel(
+            parent,
+            text="",
+            justify="left",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        self.output_bus_summary_label.pack(anchor="w", pady=(0, 10))
+
+        try:
+            output_buses = AbletonService.validate_output_buses(self.config.ableton.output_buses)
+        except Exception:
+            output_buses = AbletonService.validate_output_buses(default_output_buses())
+
+        special_frame = ctk.CTkFrame(parent)
+        special_frame.pack(fill="x", pady=(0, 12))
+
+        special_title = ctk.CTkLabel(
+            special_frame,
+            text="Special Buses",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        special_title.pack(anchor="w", padx=12, pady=(10, 8))
+
+        click_bus = next((bus for bus in output_buses if bus['role'] == 'click'), {'slot': 7, 'name': 'Click'})
+        guide_bus = next((bus for bus in output_buses if bus['role'] == 'guide'), {'slot': 8, 'name': 'Guide'})
+        self._create_special_bus_row(special_frame, 'click', click_bus)
+        self._create_special_bus_row(special_frame, 'guide', guide_bus)
+
+        content_frame = ctk.CTkFrame(parent)
+        content_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        header_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=12, pady=(10, 8))
+
+        content_title = ctk.CTkLabel(
+            header_frame,
+            text="Content Buses",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        content_title.pack(side="left")
+
+        add_bus_btn = ctk.CTkButton(
+            header_frame,
+            text="Add Content Bus",
+            width=140,
+            command=self._add_content_bus_row,
+        )
+        add_bus_btn.pack(side="right")
+
+        helper_label = ctk.CTkLabel(
+            content_frame,
+            text="Pick a slot, mono/stereo mode, a freeform name, and the routing tags that should feed that bus.",
+            justify="left",
+            font=ctk.CTkFont(size=11)
+        )
+        helper_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        self.content_bus_container = ctk.CTkFrame(content_frame, fg_color="transparent")
+        self.content_bus_container.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        content_buses = [bus for bus in output_buses if bus['role'] == 'content']
+        for bus in content_buses:
+            self._add_content_bus_row(bus)
+
+        self._update_output_bus_summary()
+
+    def _create_special_bus_row(self, parent, role: str, bus: dict) -> None:
+        """Create a compact editor row for Click or Guide."""
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="x", padx=12, pady=(0, 10))
+
+        role_label = ctk.CTkLabel(
+            frame,
+            text=role.title(),
+            width=80,
+            anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        role_label.pack(side="left", padx=(10, 10), pady=10)
+
+        slot_label = ctk.CTkLabel(frame, text="Return Slot", width=80)
+        slot_label.pack(side="left", padx=(0, 6))
+
+        slot_menu = ctk.CTkOptionMenu(
+            frame,
+            values=self.MONO_SLOT_VALUES,
+            width=90,
+            command=lambda _value: self._update_output_bus_summary()
+        )
+        slot_menu.set(str(bus.get('slot', 7 if role == 'click' else 8)))
+        slot_menu.pack(side="left", padx=(0, 12))
+
+        name_label = ctk.CTkLabel(frame, text="Bus Name", width=70)
+        name_label.pack(side="left", padx=(0, 6))
+
+        name_entry = ctk.CTkEntry(frame)
+        name_entry.insert(0, bus.get('name', role.title()))
+        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
+
+        self.special_bus_rows[role] = {
+            'slot_menu': slot_menu,
+            'name_entry': name_entry,
+            'role': role,
+        }
+
+    def _add_content_bus_row(self, bus: Optional[dict] = None) -> None:
+        """Add an editable content bus card."""
+        bus = bus or {
+            'slot': 1,
+            'mode': 'mono',
+            'name': '',
+            'tags': [],
+        }
+
+        frame = ctk.CTkFrame(self.content_bus_container)
+        frame.pack(fill="x", pady=(0, 10))
+
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(10, 6))
+
+        slot_label = ctk.CTkLabel(header, text="Slot")
+        slot_label.pack(side="left", padx=(0, 6))
+
+        slot_values = self.STEREO_SLOT_VALUES if bus.get('mode') == 'stereo' else self.MONO_SLOT_VALUES
+        slot_menu = ctk.CTkOptionMenu(
+            header,
+            values=slot_values,
+            width=90,
+            command=lambda _value: self._update_output_bus_summary()
+        )
+        slot_menu.set(str(bus.get('slot', slot_values[0])))
+        if slot_menu.get() not in slot_values:
+            slot_menu.set(slot_values[0])
+        slot_menu.pack(side="left", padx=(0, 12))
+
+        mode_label = ctk.CTkLabel(header, text="Mode")
+        mode_label.pack(side="left", padx=(0, 6))
+
+        row: dict = {'frame': frame}
+        mode_menu = ctk.CTkOptionMenu(
+            header,
+            values=['mono', 'stereo'],
+            width=100,
+            command=lambda value, row=row: self._on_content_mode_changed(row, value)
+        )
+        mode_menu.set(bus.get('mode', 'mono'))
+        mode_menu.pack(side="left", padx=(0, 12))
+
+        name_label = ctk.CTkLabel(header, text="Bus Name")
+        name_label.pack(side="left", padx=(0, 6))
+
+        name_entry = ctk.CTkEntry(header)
+        name_entry.insert(0, bus.get('name', ''))
+        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 12))
+
+        remove_btn = ctk.CTkButton(
+            header,
+            text="Remove",
+            width=80,
+            fg_color="#7a2f2f",
+            hover_color="#5c2323",
+            command=lambda row=row: self._remove_content_bus_row(row),
+        )
+        remove_btn.pack(side="right")
+
+        tags_frame = ctk.CTkFrame(frame)
+        tags_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        tags_label = ctk.CTkLabel(
+            tags_frame,
+            text="Routing Tags",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        tags_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 6))
+
+        selected_tags = {tag.strip().lower() for tag in bus.get('tags', [])}
+        tag_checkboxes: dict[str, ctk.CTkCheckBox] = {}
+        for index, (tag_value, tag_label) in enumerate(self.ROUTING_TAG_OPTIONS):
+            checkbox = ctk.CTkCheckBox(
+                tags_frame,
+                text=tag_label,
+                command=self._update_output_bus_summary
+            )
+            if tag_value in selected_tags:
+                checkbox.select()
+            row_index = 1 + index // 4
+            column_index = index % 4
+            checkbox.grid(row=row_index, column=column_index, sticky="w", padx=8, pady=(0, 6))
+            tag_checkboxes[tag_value] = checkbox
+
+        row.update({
+            'slot_menu': slot_menu,
+            'mode_menu': mode_menu,
+            'name_entry': name_entry,
+            'tag_checkboxes': tag_checkboxes,
+        })
+        self.content_bus_rows.append(row)
+        self._on_content_mode_changed(row, mode_menu.get(), update_summary=False)
+        self._update_output_bus_summary()
+
+    def _on_content_mode_changed(self, row: dict, value: str, update_summary: bool = True) -> None:
+        """Restrict valid slot choices when a content bus switches between mono and stereo."""
+        slot_menu = row['slot_menu']
+        allowed_slots = self.STEREO_SLOT_VALUES if value == 'stereo' else self.MONO_SLOT_VALUES
+        slot_menu.configure(values=allowed_slots)
+        if slot_menu.get() not in allowed_slots:
+            slot_menu.set(allowed_slots[0])
+        if update_summary:
+            self._update_output_bus_summary()
+
+    def _remove_content_bus_row(self, row: dict) -> None:
+        """Remove a content bus card from the editor."""
+        row['frame'].destroy()
+        self.content_bus_rows = [existing_row for existing_row in self.content_bus_rows if existing_row is not row]
+        self._update_output_bus_summary()
+
+    def _update_output_bus_summary(self) -> None:
+        """Refresh the live lane-usage summary for the bus editor."""
+        content_lanes_used = 0
+        occupied_slots: set[int] = set()
+        overlaps: set[int] = set()
+
+        for role, row in self.special_bus_rows.items():
+            slot = int(row['slot_menu'].get())
+            if slot in occupied_slots:
+                overlaps.add(slot)
+            occupied_slots.add(slot)
+
+        for row in self.content_bus_rows:
+            slot = int(row['slot_menu'].get())
+            mode = row['mode_menu'].get()
+            width = 2 if mode == 'stereo' else 1
+            content_lanes_used += width
+
+            for occupied_slot in range(slot, slot + width):
+                if occupied_slot in occupied_slots:
+                    overlaps.add(occupied_slot)
+                occupied_slots.add(occupied_slot)
+
+        summary_parts = [f"Content lanes used: {content_lanes_used} / 6"]
+        if overlaps:
+            summary_parts.append(f"Slot overlap: {', '.join(str(slot) for slot in sorted(overlaps))}")
+        if content_lanes_used > 6:
+            summary_parts.append("Too many content lanes selected")
+
+        warning_state = bool(overlaps) or content_lanes_used > 6
+        self.output_bus_summary_label.configure(
+            text=" | ".join(summary_parts),
+            text_color="#d97a00" if warning_state else "#3a7f43"
+        )
     
     def _save_settings(self):
         """Save settings to configuration file."""
         try:
+            output_buses = self._parse_output_buses()
+
             # Update config objects with new values
             self.config.planning_center.application_id = self.pco_app_id_entry.get().strip()
             self.config.planning_center.secret = self.pco_secret_entry.get().strip()
             self.config.multitracks.stems_folder = self.stems_folder_entry.get().strip()
             self.config.ableton.template_path = self.template_path_entry.get().strip()
             self.config.ableton.output_folder = self.output_folder_entry.get().strip()
+            self.config.ableton.output_buses = output_buses
+            self.config.ableton.enable_sub_master = bool(self.sub_master_switch.get())
+            self.config.ableton.sub_master_bus_name = self.sub_master_name_entry.get().strip() or "Sub Master"
             
             # Validate required fields
             if not self.config.planning_center.application_id:
@@ -798,6 +1108,35 @@ class SettingsDialog:
                 "Error",
                 f"Failed to save settings:\n{str(e)}"
             )
+
+    def _parse_output_buses(self) -> list[dict]:
+        """Collect and validate the structured output bus editor state."""
+        output_buses = []
+
+        for role, row in self.special_bus_rows.items():
+            output_buses.append({
+                'slot': int(row['slot_menu'].get()),
+                'role': role,
+                'mode': 'mono',
+                'name': row['name_entry'].get().strip(),
+                'tags': [],
+            })
+
+        for row in self.content_bus_rows:
+            selected_tags = [
+                tag_value
+                for tag_value, checkbox in row['tag_checkboxes'].items()
+                if bool(checkbox.get())
+            ]
+            output_buses.append({
+                'slot': int(row['slot_menu'].get()),
+                'role': 'content',
+                'mode': row['mode_menu'].get(),
+                'name': row['name_entry'].get().strip(),
+                'tags': selected_tags,
+            })
+
+        return AbletonService.validate_output_buses(output_buses)
     
     def _test_connection(self):
         """Test Planning Center Online connection."""

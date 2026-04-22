@@ -4,6 +4,7 @@ import gzip
 import zipfile
 import wave
 import xml.etree.ElementTree as ET
+import tkinter as tk
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -13,10 +14,13 @@ import tempfile
 import os
 import copy
 import zlib
+import re
+from tkinter import messagebox, ttk
 
-from ..core.config import AbletonConfig
+from ..core.config import AbletonConfig, default_output_buses
 from ._audio_clip_template import create_audio_clip_template
 from ._blank_audio_track import create_blank_audio_track_template
+from ._blank_return_track import create_blank_return_track_template
 from .multitracks_service import AudioStem, StemMatch
 
 @dataclass
@@ -28,17 +32,58 @@ class AbletonTrack:
     color: Optional[int] = None
     is_group_track: bool = False
 
+
+class GenerationCancelledError(Exception):
+    """Raised when the user cancels a required generation input."""
+
 class AbletonService:
     """Service for working with Ableton Live project files."""
 
-    STEM_SEND_ROUTING = {
-        'perc': (0, 8),
-        'bass': (1, 8),
-        'leads': (2, 8),
-        'strings': (3, 8),
-        'keys': (4, 8),
-        'vocals': (5, 8),
-        'guide': (7, 8),
+    KEY_OPTION_ORDER = ('AB', 'A', 'BB', 'B', 'C', 'DB', 'D', 'EB', 'E', 'F', 'GB', 'G')
+    KEY_DISPLAY_NAMES = {
+        'AB': 'Ab',
+        'A': 'A',
+        'BB': 'Bb',
+        'B': 'B',
+        'C': 'C',
+        'DB': 'Db',
+        'D': 'D',
+        'EB': 'Eb',
+        'E': 'E',
+        'F': 'F',
+        'GB': 'Gb',
+        'G': 'G',
+    }
+
+    KEY_TO_SEMITONE = {
+        'C': 0,
+        'B#': 0,
+        'C#': 1,
+        'DB': 1,
+        'D': 2,
+        'D#': 3,
+        'EB': 3,
+        'E': 4,
+        'FB': 4,
+        'F': 5,
+        'E#': 5,
+        'F#': 6,
+        'GB': 6,
+        'G': 7,
+        'G#': 8,
+        'AB': 8,
+        'A': 9,
+        'A#': 10,
+        'BB': 10,
+        'B': 11,
+        'CB': 11,
+    }
+    STEM_WARP_MODES = {
+        'bass': 4,
+        'leads': 4,
+        'strings': 4,
+        'keys': 4,
+        'vocals': 6,
     }
     STEM_GROUP_ORDER = ('perc', 'bass', 'leads', 'strings', 'keys', 'vocals')
     STEM_GROUP_NAMES = {
@@ -50,6 +95,82 @@ class AbletonService:
         'vocals': 'Vocals',
     }
     OFF_SEND_LEVEL = 0.0003162277571
+
+    @classmethod
+    def validate_output_buses(cls, output_buses: Any) -> List[Dict[str, Any]]:
+        """Validate and normalize logical bus configuration."""
+        if not isinstance(output_buses, list) or not output_buses:
+            raise ValueError('Output bus layout must be a non-empty list.')
+
+        normalized: List[Dict[str, Any]] = []
+        occupied_slots: set[int] = set()
+        seen_roles: set[str] = set()
+        content_lane_count = 0
+
+        for raw_bus in output_buses:
+            if not isinstance(raw_bus, dict):
+                raise ValueError('Each output bus must be an object.')
+
+            role = str(raw_bus.get('role', 'content')).strip().lower()
+            mode = str(raw_bus.get('mode', 'mono')).strip().lower()
+            name = str(raw_bus.get('name', '')).strip()
+
+            try:
+                slot = int(raw_bus.get('slot'))
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid bus slot '{raw_bus.get('slot')}'.")
+
+            if slot < 1 or slot > 8:
+                raise ValueError(f"Bus slot {slot} is outside the valid 1-8 range.")
+
+            if role not in {'content', 'click', 'guide'}:
+                raise ValueError(f"Unsupported bus role '{role}'.")
+
+            if not name:
+                raise ValueError(f"Bus in slot {slot} must have a name.")
+
+            if role in {'click', 'guide'}:
+                if role in seen_roles:
+                    raise ValueError(f"Only one '{role}' bus can be defined.")
+                seen_roles.add(role)
+                mode = 'mono'
+                tags: List[str] = []
+            else:
+                if mode not in {'mono', 'stereo'}:
+                    raise ValueError(f"Unsupported content bus mode '{mode}' in slot {slot}.")
+                tags = sorted({str(tag).strip().lower() for tag in raw_bus.get('tags', []) if str(tag).strip()})
+                if not tags:
+                    raise ValueError(f"Content bus '{name}' in slot {slot} must include at least one routing tag.")
+
+            occupied_width = 2 if mode == 'stereo' else 1
+            if mode == 'stereo' and (slot % 2 == 0 or slot + 1 > 8):
+                raise ValueError(f"Stereo bus '{name}' must start on an odd slot with an adjacent pair.")
+
+            for occupied_slot in range(slot, slot + occupied_width):
+                if occupied_slot in occupied_slots:
+                    raise ValueError(f"Bus '{name}' overlaps an existing assignment at slot {occupied_slot}.")
+                occupied_slots.add(occupied_slot)
+
+            if role == 'content':
+                content_lane_count += occupied_width
+
+            normalized.append({
+                'slot': slot,
+                'role': role,
+                'mode': mode,
+                'name': name,
+                'tags': tags,
+            })
+
+        missing_roles = {'click', 'guide'} - seen_roles
+        if missing_roles:
+            missing = ', '.join(sorted(missing_roles))
+            raise ValueError(f"Output bus layout must define: {missing}.")
+
+        if content_lane_count > 6:
+            raise ValueError('Content buses cannot consume more than 6 logical lanes total.')
+
+        return sorted(normalized, key=lambda bus: (bus['slot'], bus['role'] != 'content'))
 
     def __init__(self, config: AbletonConfig):
         """Initialize the Ableton service.
@@ -63,12 +184,25 @@ class AbletonService:
         self.template_format = None  # Will be set to 'zip' or 'gzip' when loading template
         self.template_midi_clip = None  # Template MidiClip to use as base for copies
         self.blank_audio_track_template = create_blank_audio_track_template()
+        self.blank_return_track_template = create_blank_return_track_template()
         self.audio_clip_template = create_audio_clip_template()
+        self.source_key_cache: Dict[str, Optional[str]] = {}
+        self.output_buses = self._load_output_buses()
+        self.active_return_buses: List[Dict[str, Any]] = []
+        self.return_bus_indexes: Dict[str, int] = {}
 
         # Ensure output folder exists
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Ableton service initialized with template: {self.template_path}")
+
+    def _load_output_buses(self) -> List[Dict[str, Any]]:
+        """Load normalized bus layout from config, falling back to defaults if needed."""
+        try:
+            return self.validate_output_buses(self.config.output_buses)
+        except ValueError as exc:
+            logger.warning(f"Invalid output bus layout in config, using defaults: {exc}")
+            return self.validate_output_buses(default_output_buses())
 
     def generate_setlist(self, service_type_name: str, service_date, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> Optional[Path]:
         """Generate an Ableton Live setlist from stem matches.
@@ -109,6 +243,9 @@ class AbletonService:
             logger.info(f"Generated setlist: {als_file_path}")
             return als_file_path
 
+        except GenerationCancelledError as e:
+            logger.warning(f"Setlist generation cancelled: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to generate setlist: {e}")
             return None
@@ -248,12 +385,159 @@ class AbletonService:
 
         # Replace existing placeholder markers with actual song titles
         self._populate_existing_markers(liveset, stem_matches, plan_songs)
+
+        # Rebuild logical return buses from the saved output layout.
+        self._prepare_output_buses(liveset)
         
         # Add guide stems and MIDI clips for each song (if arrangement data available)
         if plan_songs:
             self._add_guides_and_midi_clips(liveset, stem_matches, plan_songs, als_file_path)
             # Add tempo mapping for each song
             self._add_tempo_mapping(liveset, plan_songs)
+
+    def _prepare_output_buses(self, liveset: ET.Element) -> None:
+        """Rebuild return buses from config so generation does not depend on template returns."""
+        tracks = liveset.find('.//Tracks')
+        if tracks is None:
+            logger.warning('No Tracks element found; cannot rebuild return buses')
+            self.active_return_buses = []
+            self.return_bus_indexes = {}
+            return
+
+        active_buses = [dict(bus) for bus in self.output_buses]
+        if self.config.enable_sub_master:
+            active_buses.append({
+                'slot': 99,
+                'role': 'sub_master',
+                'mode': 'mono',
+                'name': self.config.sub_master_bus_name or 'Sub Master',
+                'tags': [],
+            })
+
+        self._remove_existing_return_tracks(tracks)
+        self.active_return_buses = []
+
+        insert_index = self._get_generated_track_insert_index(tracks)
+        for bus in active_buses:
+            new_return_track = self._create_return_track(
+                liveset,
+                tracks,
+                bus['name'],
+                insert_index,
+                muted=bus['role'] == 'sub_master',
+            )
+            if new_return_track is None:
+                continue
+
+            bus['send_index'] = len(self.active_return_buses)
+            self.active_return_buses.append(bus)
+            insert_index += 1
+
+        send_count = len(self.active_return_buses)
+        self.return_bus_indexes = {
+            bus['role']: bus['send_index']
+            for bus in self.active_return_buses
+            if bus['role'] in {'click', 'guide', 'sub_master'}
+        }
+
+        if send_count > 0:
+            self._sync_sends_pre(liveset, send_count)
+            self._ensure_tracks_send_count(liveset, tracks, send_count)
+            self._configure_click_track_routing(tracks)
+            self._configure_existing_guide_track_routing(tracks)
+            self._update_next_pointee_id(liveset)
+        else:
+            self._sync_sends_pre(liveset, 0)
+
+    def _remove_existing_return_tracks(self, tracks: ET.Element) -> None:
+        """Remove all return tracks so the configured bus layout becomes the source of truth."""
+        for child in list(tracks):
+            if child.tag == 'ReturnTrack':
+                tracks.remove(child)
+
+    def _sync_sends_pre(self, liveset: ET.Element, send_count: int) -> None:
+        """Keep LiveSet/SendsPre aligned with the active return-bus count."""
+        sends_pre = liveset.find('SendsPre')
+        if sends_pre is None:
+            sends_pre = ET.Element('SendsPre')
+            insert_index = next((index for index, child in enumerate(list(liveset)) if child.tag == 'Scenes'), len(list(liveset)))
+            liveset.insert(insert_index, sends_pre)
+
+        for child in list(sends_pre):
+            sends_pre.remove(child)
+
+        next_id = self._next_available_id(liveset)
+        for _ in range(send_count):
+            send_pre_bool = ET.SubElement(sends_pre, 'SendPreBool')
+            send_pre_bool.set('Id', str(next_id))
+            send_pre_bool.set('Value', 'false')
+            next_id += 1
+
+    def _create_return_track(
+        self,
+        liveset: ET.Element,
+        tracks: ET.Element,
+        track_name: str,
+        insert_index: int,
+        muted: bool = False,
+    ) -> Optional[ET.Element]:
+        """Create a generated return bus from the embedded ReturnTrack template."""
+        try:
+            new_track = copy.deepcopy(self.blank_return_track_template)
+            next_id = self._next_available_id(liveset)
+            new_track.set('Id', str(next_id))
+            next_id += 1
+
+            next_id = self._remap_audio_track_internal_ids(new_track, next_id)
+            self._set_track_name(new_track, track_name)
+            self._set_track_volume(new_track, 1.0)
+            self._set_track_muted(new_track, muted)
+            self._set_track_group_id(new_track, None)
+            self._set_audio_output_routing(new_track, 'AudioOut/Master', 'Master')
+
+            for selected_elem in new_track.iter('IsContentSelectedInDocument'):
+                selected_elem.set('Value', 'false')
+
+            tracks.insert(insert_index, new_track)
+            return new_track
+
+        except Exception as exc:
+            logger.error(f"Failed to create return track '{track_name}': {exc}", exc_info=True)
+            return None
+
+    def _ensure_tracks_send_count(self, liveset: ET.Element, tracks: ET.Element, send_count: int) -> None:
+        """Ensure every routable track has enough send holders for the generated buses."""
+        for child in tracks:
+            if child.tag not in {'AudioTrack', 'MidiTrack', 'GroupTrack', 'ReturnTrack'}:
+                continue
+
+            self._resize_track_sends(child, send_count, liveset)
+
+    def _configure_click_track_routing(self, tracks: ET.Element) -> None:
+        """Route the template click track to the configured click bus when present."""
+        send_indexes = self._special_bus_send_indexes('click')
+        if not send_indexes:
+            return
+
+        for track in tracks.findall('MidiTrack'):
+            if 'click' not in self._get_track_name(track).lower():
+                continue
+
+            self._configure_track_send_routing(track, send_indexes)
+            return
+
+    def _configure_existing_guide_track_routing(self, tracks: ET.Element) -> None:
+        """Route an existing template guide track to the configured guide bus if present."""
+        send_indexes = self._special_bus_send_indexes('guide')
+        if not send_indexes:
+            return
+
+        for track in tracks.findall('AudioTrack'):
+            if self._get_track_name(track).strip().lower() != 'guide':
+                continue
+
+            self._configure_track_send_routing(track, send_indexes)
+            return
 
     def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
         """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles and keys."""
@@ -408,6 +692,12 @@ class AbletonService:
             stem_match = stem_matches[song.title]
             bpm = song.arrangement.bpm if song.arrangement and song.arrangement.bpm else 120
             song_color = self._get_song_color_from_click_track(tracks, song_start_beat)
+            song_source_key = self._resolve_song_source_key(song, stem_match.stems) if song.key_name else None
+            song_pitch_shift = self._calculate_song_pitch_shift(song_source_key, song.key_name)
+            if song_source_key is not None and song.key_name:
+                logger.info(
+                    f"Key mapping for '{song.title}': {song_source_key} -> {self._normalize_key_name(song.key_name)} ({song_pitch_shift:+d} st)"
+                )
 
             primary_guide_wav = self._select_primary_guide_wav(stem_match.stems)
             if primary_guide_wav and als_file_path is not None:
@@ -416,7 +706,15 @@ class AbletonService:
                     shared_guide_audio_track = self._create_guide_audio_track(liveset, tracks, "Guide")
 
                 if shared_guide_audio_track is not None:
-                    self._add_audio_clip_to_track(shared_guide_audio_track, primary_guide_wav, song_start_beat, bpm, als_file_path, song_color)
+                    self._add_audio_clip_to_track(
+                        shared_guide_audio_track,
+                        primary_guide_wav,
+                        song_start_beat,
+                        bpm,
+                        als_file_path,
+                        song_color,
+                        pitch_shift=song_pitch_shift,
+                    )
             elif guide_track_idx is not None:
                 guide_stem = self._select_primary_guide_stem(stem_match.stems)
                 if guide_stem is not None:
@@ -436,6 +734,7 @@ class AbletonService:
                     bpm,
                     als_file_path,
                     song_color,
+                    song_pitch_shift,
                 ):
                     self._add_flat_song_audio_tracks(
                         liveset,
@@ -446,6 +745,7 @@ class AbletonService:
                         bpm,
                         als_file_path,
                         song_color,
+                        song_pitch_shift,
                     )
 
             if midi_track_idx is not None and song.arrangement and song.arrangement.sequence:
@@ -748,23 +1048,32 @@ class AbletonService:
 
         return 0
 
-    def _resize_track_sends(self, track: ET.Element, send_count: int) -> None:
-        """Resize the embedded blank track's send holders to match the template."""
+    def _remap_send_holder_target_ids(self, holder: ET.Element, next_id: int) -> int:
+        """Assign unique automation/modulation ids to a newly cloned send holder."""
+        for elem in holder.iter():
+            if elem.tag in {'AutomationTarget', 'ModulationTarget'}:
+                elem.set('Id', str(next_id))
+                next_id += 1
+        return next_id
+
+    def _resize_track_sends(self, track: ET.Element, send_count: int, id_scope: Optional[ET.Element] = None) -> None:
+        """Resize a track's send holders to match the generated return-bus count."""
         sends = track.find('.//Mixer/Sends')
         if sends is None:
             return
 
         send_holders = sends.findall('TrackSendHolder')
-        if not send_holders:
+        prototype = send_holders[-1] if send_holders else self.blank_audio_track_template.find('.//Mixer/Sends/TrackSendHolder')
+        if prototype is None:
             return
-
-        prototype = send_holders[-1]
 
         while len(send_holders) > send_count:
             sends.remove(send_holders.pop())
 
+        next_id = self._next_available_id(id_scope) if id_scope is not None else 1
         while len(send_holders) < send_count:
             cloned_holder = copy.deepcopy(prototype)
+            next_id = self._remap_send_holder_target_ids(cloned_holder, next_id)
             sends.append(cloned_holder)
             send_holders.append(cloned_holder)
 
@@ -817,6 +1126,12 @@ class AbletonService:
         if active_elem is not None:
             active_elem.set('Value', 'true' if active else 'false')
 
+    def _set_track_muted(self, track: ET.Element, muted: bool) -> None:
+        """Set the mixer speaker state for a track or return bus."""
+        speaker_manual = track.find('.//Mixer/Speaker/Manual')
+        if speaker_manual is not None:
+            speaker_manual.set('Value', 'false' if muted else 'true')
+
     def _reset_track_sends(self, track: ET.Element, level: float = OFF_SEND_LEVEL) -> None:
         """Normalize all track sends before enabling the routing this generator needs."""
         sends = track.find('.//Mixer/Sends')
@@ -860,12 +1175,17 @@ class AbletonService:
         if lower_display_string is not None:
             lower_display_string.set('Value', lower_display)
 
-    def _configure_generated_audio_track_routing(self, track: ET.Element, stem_type: str) -> None:
-        """Route generated audio tracks to Sends Only and feed the correct category buses."""
+    def _configure_track_send_routing(self, track: ET.Element, send_indexes: List[int]) -> None:
+        """Route a track to Sends Only and enable only the requested generated buses."""
+        self._reset_track_sends(track)
         self._set_audio_output_routing(track, 'AudioOut/None', 'Sends Only')
 
-        for send_index in self.STEM_SEND_ROUTING.get(stem_type, (8,)):
+        for send_index in send_indexes:
             self._set_track_send_level(track, send_index, 1.0)
+
+    def _configure_generated_audio_track_routing(self, track: ET.Element, send_indexes: List[int]) -> None:
+        """Route generated audio tracks into the selected logical return buses."""
+        self._configure_track_send_routing(track, send_indexes)
 
     def _configure_generated_group_track(
         self,
@@ -883,12 +1203,6 @@ class AbletonService:
 
         self._set_audio_output_routing(track, 'AudioOut/GroupTrack', 'Group')
 
-        if stem_type is None:
-            return
-
-        for send_index in self.STEM_SEND_ROUTING.get(stem_type, (8,)):
-            self._set_track_send_level(track, send_index, 1.0)
-
     def _select_song_audio_wavs(self, stems: List[AudioStem]) -> List[AudioStem]:
         """Return non-guide WAV stems that can be routed into generated audio tracks."""
         audio_stems = []
@@ -896,9 +1210,6 @@ class AbletonService:
             if stem.path.suffix.lower() != '.wav':
                 continue
             if stem.stem_type == 'guide':
-                continue
-            if stem.stem_type not in self.STEM_SEND_ROUTING:
-                logger.debug(f"Skipping unroutable stem type '{stem.stem_type}' for {stem.filename}")
                 continue
             audio_stems.append(stem)
 
@@ -910,6 +1221,312 @@ class AbletonService:
         if song_title.lower() in stem_name.lower():
             return stem_name
         return f"{song_title} - {stem_name}"
+
+    def _special_bus_send_indexes(self, role: str) -> List[int]:
+        """Return the generated send indexes for a non-content bus role."""
+        send_indexes: List[int] = []
+
+        send_index = self.return_bus_indexes.get(role)
+        if send_index is not None:
+            send_indexes.append(send_index)
+
+        sub_master_index = self.return_bus_indexes.get('sub_master')
+        if role != 'sub_master' and sub_master_index is not None:
+            send_indexes.append(sub_master_index)
+
+        return send_indexes
+
+    def _ordered_routing_tags_for_stem(self, stem: AudioStem) -> List[str]:
+        """Return ordered routing tags from most-specific to broadest for a stem."""
+        stem_name = stem.path.stem.lower()
+        tags: List[str] = []
+
+        def add_tag(tag: str) -> None:
+            if tag not in tags:
+                tags.append(tag)
+
+        if stem.stem_type == 'perc':
+            if any(keyword in stem_name for keyword in {'drum', 'kit', 'live'}):
+                add_tag('drums')
+            if 'loop' in stem_name:
+                add_tag('loops')
+            if any(keyword in stem_name for keyword in {'perc', 'percussion', 'fx'}):
+                add_tag('percussion')
+            add_tag('perc')
+            return tags
+
+        if stem.stem_type == 'bass':
+            add_tag('bass')
+            return tags
+
+        if stem.stem_type == 'strings':
+            if any(keyword in stem_name for keyword in {'ag', 'acoustic'}):
+                add_tag('acoustic_guitar')
+                add_tag('guitars')
+            if any(keyword in stem_name for keyword in {'eg', 'electric', 'ax', 'axe', 'gtr'}):
+                add_tag('electric_guitar')
+                add_tag('guitars')
+            if any(keyword in stem_name for keyword in {'lead', 'hook', 'line', 'solo', 'melody'}):
+                add_tag('lead_line')
+            if any(keyword in stem_name for keyword in {'orch', 'orchestral', 'violin', 'viola', 'cello', 'strings'}):
+                add_tag('orchestra')
+            add_tag('strings')
+            return tags
+
+        if stem.stem_type == 'keys':
+            if 'piano' in stem_name:
+                add_tag('piano')
+            if any(keyword in stem_name for keyword in {'synth', 'pad', 'moog', 'additional', 'additionals'}):
+                add_tag('synth')
+            if any(keyword in stem_name for keyword in {'keys', 'key ', 'organ', 'rhodes', 'wurlitzer', 'clav'}):
+                add_tag('keys')
+            if not tags:
+                add_tag('keys')
+            return tags
+
+        if stem.stem_type == 'vocals':
+            if any(keyword in stem_name for keyword in {'bgv', 'bgvs', 'choir', 'alto', 'soprano', 'tenor'}):
+                add_tag('bgvs')
+            else:
+                add_tag('lead_vocal')
+            add_tag('vocals')
+            return tags
+
+        if stem.stem_type == 'guide':
+            add_tag('click' if self._is_click_stem(stem) else 'guide')
+
+        return tags
+
+    def _resolve_content_bus_for_stem(self, stem: AudioStem) -> Optional[Dict[str, Any]]:
+        """Resolve the configured content bus for a stem from its ordered routing tags."""
+        content_buses = [bus for bus in self.active_return_buses if bus['role'] == 'content']
+        if not content_buses:
+            return None
+
+        for tag in self._ordered_routing_tags_for_stem(stem):
+            for bus in content_buses:
+                if tag in bus['tags']:
+                    return bus
+
+        return None
+
+    def _send_indexes_for_audio_stem(self, stem: AudioStem) -> List[int]:
+        """Return the active send indexes for a generated audio stem track."""
+        send_indexes: List[int] = []
+        content_bus = self._resolve_content_bus_for_stem(stem)
+        if content_bus is not None:
+            send_indexes.append(content_bus['send_index'])
+        else:
+            logger.warning(f"No configured content bus matched stem '{stem.filename}'")
+
+        sub_master_index = self.return_bus_indexes.get('sub_master')
+        if sub_master_index is not None:
+            send_indexes.append(sub_master_index)
+
+        return send_indexes
+
+    def _extract_key_token(self, text: str) -> Optional[str]:
+        """Extract a musical key token from a filename or folder name."""
+        for pattern in (
+            r'\[\s*([A-G](?:#|b)?(?:m|maj|min|minor|major)?)\s*\]',
+            r'\(\s*([A-G](?:#|b)?(?:m|maj|min|minor|major)?)\s*\)',
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                normalized = self._normalize_key_name(match.group(1))
+                if normalized:
+                    return normalized
+        return None
+
+    def _normalize_key_name(self, key_name: Optional[str]) -> Optional[str]:
+        """Normalize key strings like Db, C#m, or B major to a pitch-class root."""
+        if not key_name:
+            return None
+
+        match = re.search(r'([A-Ga-g])\s*([#bB]?)', key_name.strip())
+        if not match:
+            return None
+
+        letter = match.group(1).upper()
+        accidental = match.group(2).replace('B', 'b')
+        normalized = f"{letter}{accidental}".upper()
+        return normalized if normalized in self.KEY_TO_SEMITONE else None
+
+    def _collect_song_key_candidates(self, stems: List[AudioStem]) -> List[str]:
+        """Collect unique source-key candidates from stem filenames and parent folders."""
+        candidates: List[str] = []
+        scanned_directories: set[Path] = set()
+        song_title = stems[0].song_title if stems else ''
+
+        def normalize_name(text: str) -> str:
+            return re.sub(r'[^a-z0-9]+', '', text.lower())
+
+        normalized_song_title = normalize_name(song_title)
+
+        def is_song_container(path: Path) -> bool:
+            return bool(normalized_song_title) and normalized_song_title in normalize_name(path.name)
+
+        for stem in stems:
+            path_texts = [stem.filename, stem.path.stem]
+            relevant_parents: List[Path] = []
+
+            for parent in stem.path.parents:
+                if not parent.name:
+                    break
+
+                relevant_parents.append(parent)
+                if is_song_container(parent):
+                    break
+
+            path_texts.extend(parent.name for parent in relevant_parents if parent.name)
+
+            for parent in relevant_parents:
+                if parent in scanned_directories or not parent.exists() or not parent.is_dir():
+                    continue
+
+                scanned_directories.add(parent)
+
+                try:
+                    path_texts.extend(child.name for child in parent.iterdir() if child.name and not child.name.startswith('.'))
+                except OSError as exc:
+                    logger.debug(f"Unable to inspect directory '{parent}' for key hints: {exc}")
+
+            for text in path_texts:
+                candidate = self._extract_key_token(text)
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+
+        return candidates
+
+    def _format_key_display(self, key_name: Optional[str]) -> Optional[str]:
+        """Return a user-facing key label for a normalized pitch class."""
+        normalized = self._normalize_key_name(key_name)
+        if normalized is None:
+            return None
+        return self.KEY_DISPLAY_NAMES.get(normalized, normalized)
+
+    def _prompt_for_song_source_key(self, song_title: str, plan_key: Optional[str], stems: List[AudioStem], candidates: List[str]) -> Optional[str]:
+        """Ask the user for the source key when filenames/folders are ambiguous."""
+        sample_names = ', '.join(sorted({stem.path.parent.name for stem in stems})[:3])
+        candidate_text = ', '.join(self._format_key_display(candidate) or candidate for candidate in candidates) if candidates else 'none detected'
+        prompt = (
+            f"Couldn't confidently determine the source key for '{song_title}'.\n\n"
+            f"Planning Center key: {self._format_key_display(plan_key) or plan_key or 'unknown'}\n"
+            f"Detected candidates: {candidate_text}\n"
+            f"Stem folders: {sample_names or 'n/a'}\n\n"
+            "Choose the source key for these stems."
+        )
+
+        selected_key: Dict[str, Optional[str]] = {'value': None}
+        options = [self.KEY_DISPLAY_NAMES[key] for key in self.KEY_OPTION_ORDER]
+
+        preferred_key = next(
+            (
+                self._normalize_key_name(candidate)
+                for candidate in candidates
+                if self._normalize_key_name(candidate) in self.KEY_DISPLAY_NAMES
+            ),
+            None,
+        )
+        if preferred_key is None:
+            preferred_key = self._normalize_key_name(plan_key)
+        if preferred_key is None:
+            preferred_key = self.KEY_OPTION_ORDER[0]
+
+        try:
+            root = tk._get_temp_root()
+            dialog = tk.Toplevel(root)
+            dialog.title("Resolve Stem Key")
+            dialog.resizable(False, False)
+            dialog.transient(root)
+            dialog.grab_set()
+
+            message = tk.Label(dialog, text=prompt, justify='left', anchor='w', wraplength=420)
+            message.pack(padx=16, pady=(16, 12), fill='both')
+
+            selected_value = tk.StringVar(value=self.KEY_DISPLAY_NAMES[preferred_key])
+            combo = ttk.Combobox(dialog, textvariable=selected_value, values=options, state='readonly', width=12)
+            combo.pack(padx=16, pady=(0, 16), fill='x')
+            combo.focus_set()
+
+            button_row = tk.Frame(dialog)
+            button_row.pack(padx=16, pady=(0, 16), fill='x')
+
+            def confirm() -> None:
+                selected_key['value'] = self._normalize_key_name(selected_value.get())
+                dialog.destroy()
+
+            def cancel() -> None:
+                dialog.destroy()
+
+            ttk.Button(button_row, text='OK', command=confirm).pack(side='right')
+            ttk.Button(button_row, text='Cancel', command=cancel).pack(side='right', padx=(0, 8))
+
+            dialog.protocol('WM_DELETE_WINDOW', cancel)
+            dialog.bind('<Return>', lambda event: confirm())
+            dialog.bind('<Escape>', lambda event: cancel())
+            dialog.wait_window()
+        except Exception as exc:
+            logger.warning(f"Unable to prompt for source key for '{song_title}': {exc}")
+            return None
+
+        if selected_key['value'] is None:
+            raise GenerationCancelledError(f"Source key selection cancelled for '{song_title}'")
+
+        return selected_key['value']
+
+    def _resolve_song_source_key(self, song, stems: List[AudioStem]) -> Optional[str]:
+        """Resolve a song's stem source key from metadata or a one-time user prompt."""
+        if song.title in self.source_key_cache:
+            return self.source_key_cache[song.title]
+
+        candidates = self._collect_song_key_candidates(stems)
+        if len(candidates) == 1:
+            resolved_key = candidates[0]
+        elif len(candidates) > 1:
+            logger.warning(f"Multiple source keys detected for '{song.title}': {candidates}")
+            resolved_key = self._prompt_for_song_source_key(song.title, song.key_name, stems, candidates)
+        else:
+            logger.warning(f"No source key detected for '{song.title}'")
+            resolved_key = self._prompt_for_song_source_key(song.title, song.key_name, stems, candidates)
+
+        self.source_key_cache[song.title] = resolved_key
+        if resolved_key is not None:
+            logger.info(f"Resolved source key for '{song.title}': {resolved_key}")
+        return resolved_key
+
+    def _calculate_song_pitch_shift(self, source_key: Optional[str], target_key: Optional[str]) -> int:
+        """Return the shortest semitone move from source key to target key."""
+        normalized_source = self._normalize_key_name(source_key)
+        normalized_target = self._normalize_key_name(target_key)
+        if normalized_source is None or normalized_target is None:
+            return 0
+
+        diff = (self.KEY_TO_SEMITONE[normalized_target] - self.KEY_TO_SEMITONE[normalized_source]) % 12
+        if diff > 6:
+            diff -= 12
+        return diff
+
+    def _apply_clip_warp_settings(self, clip: ET.Element, stem_type: str, pitch_shift: int) -> None:
+        """Apply Ableton warp and transposition settings to a generated audio clip."""
+        should_preserve_original = stem_type in {'perc', 'guide'}
+        should_warp = not should_preserve_original and stem_type in self.STEM_WARP_MODES
+
+        is_warped_elem = clip.find('IsWarped')
+        if is_warped_elem is not None:
+            is_warped_elem.set('Value', 'true' if should_warp else 'false')
+
+        warp_mode_elem = clip.find('WarpMode')
+        if warp_mode_elem is not None and should_warp:
+            warp_mode_elem.set('Value', str(self.STEM_WARP_MODES[stem_type]))
+
+        pitch_coarse_elem = clip.find('PitchCoarse')
+        if pitch_coarse_elem is not None:
+            pitch_coarse_elem.set('Value', str(0 if should_preserve_original else pitch_shift))
+
+        pitch_fine_elem = clip.find('PitchFine')
+        if pitch_fine_elem is not None:
+            pitch_fine_elem.set('Value', '0')
 
     def _build_placeholder_track_name(self, song_title: str, stem_type: str) -> str:
         """Build a readable placeholder track name for empty generated groups."""
@@ -935,6 +1552,7 @@ class AbletonService:
         bpm: float,
         als_file_path: Path,
         song_color: Optional[str],
+        pitch_shift: int,
     ) -> None:
         """Fallback path when no GroupTrack template exists in the source set."""
         for audio_stem in audio_stems:
@@ -942,9 +1560,24 @@ class AbletonService:
                 f"Adding {audio_stem.stem_type} wav for '{song_title}' at beat {beat_position}: {audio_stem.filename}"
             )
             track_name = self._build_song_audio_track_name(song_title, audio_stem)
-            new_track = self._create_audio_track(liveset, tracks, track_name, audio_stem.stem_type, song_color)
+            new_track = self._create_audio_track(
+                liveset,
+                tracks,
+                track_name,
+                audio_stem.stem_type,
+                song_color,
+                send_indexes=self._send_indexes_for_audio_stem(audio_stem),
+            )
             if new_track is not None:
-                self._add_audio_clip_to_track(new_track, audio_stem, beat_position, bpm, als_file_path, song_color)
+                self._add_audio_clip_to_track(
+                    new_track,
+                    audio_stem,
+                    beat_position,
+                    bpm,
+                    als_file_path,
+                    song_color,
+                    pitch_shift=pitch_shift,
+                )
 
     def _add_grouped_song_audio_tracks(
         self,
@@ -956,6 +1589,7 @@ class AbletonService:
         bpm: float,
         als_file_path: Path,
         song_color: Optional[str],
+        pitch_shift: int,
     ) -> bool:
         """Create Song -> Stem Group -> Audio Track hierarchy for a song's routed WAVs."""
         if self._find_group_track_template(tracks) is None:
@@ -1023,10 +1657,19 @@ class AbletonService:
                     audio_stem.stem_type,
                     song_color,
                     parent_group_id=parent_group_id,
+                    send_indexes=self._send_indexes_for_audio_stem(audio_stem),
                     insert_index=insert_index,
                 )
                 if new_track is not None:
-                    self._add_audio_clip_to_track(new_track, audio_stem, beat_position, bpm, als_file_path, song_color)
+                    self._add_audio_clip_to_track(
+                        new_track,
+                        audio_stem,
+                        beat_position,
+                        bpm,
+                        als_file_path,
+                        song_color,
+                        pitch_shift=pitch_shift,
+                    )
                     insert_index += 1
 
         return True
@@ -1194,6 +1837,7 @@ class AbletonService:
         bpm: float,
         als_file_path: Path,
         clip_color: Optional[str] = None,
+        pitch_shift: int = 0,
     ) -> ET.Element:
         """Create an Ableton-style AudioClip element for a guide WAV."""
         clip = copy.deepcopy(self.audio_clip_template)
@@ -1201,6 +1845,8 @@ class AbletonService:
         frame_count, sample_rate, duration_seconds = self._get_wav_metadata(guide_wav.path)
         duration_beats = (duration_seconds * bpm / 60.0) if bpm else 0.0
         clip_end_beat = beat_position + duration_beats
+        should_warp = guide_wav.stem_type in self.STEM_WARP_MODES and guide_wav.stem_type not in {'perc', 'guide'}
+        loop_end_value = duration_beats if should_warp else duration_seconds
         relative_path = os.path.relpath(guide_wav.path, als_file_path.parent).replace(os.sep, '/')
         file_stat = guide_wav.path.stat()
         file_crc = 0
@@ -1213,11 +1859,11 @@ class AbletonService:
             'CurrentStart': beat_position,
             'CurrentEnd': clip_end_beat,
             'Loop/LoopStart': 0,
-            'Loop/LoopEnd': duration_seconds,
+            'Loop/LoopEnd': loop_end_value,
             'Loop/StartRelative': 0,
-            'Loop/OutMarker': duration_seconds,
+            'Loop/OutMarker': loop_end_value,
             'Loop/HiddenLoopStart': 0,
-            'Loop/HiddenLoopEnd': duration_seconds,
+            'Loop/HiddenLoopEnd': loop_end_value,
             'Name': guide_wav.filename,
             'ScrollerTimePreserver/LeftTime': 0,
             'ScrollerTimePreserver/RightTime': duration_seconds,
@@ -1242,10 +1888,19 @@ class AbletonService:
         if warp_markers is not None:
             markers = warp_markers.findall('WarpMarker')
             if len(markers) >= 3:
+                terminal_marker_seconds = (1.0 / sample_rate) if sample_rate else 0.000001
+                terminal_marker_beats = (terminal_marker_seconds * bpm / 60.0) if bpm else 0.000001
+
                 markers[1].set('SecTime', str(duration_seconds))
-                markers[2].set('SecTime', str(duration_seconds))
                 markers[1].set('BeatTime', str(duration_beats))
-                markers[2].set('BeatTime', str(duration_beats))
+                if should_warp:
+                    markers[2].set('SecTime', str(duration_seconds + terminal_marker_seconds))
+                    markers[2].set('BeatTime', str(duration_beats + terminal_marker_beats))
+                else:
+                    markers[2].set('SecTime', str(duration_seconds))
+                    markers[2].set('BeatTime', str(duration_beats))
+
+        self._apply_clip_warp_settings(clip, guide_wav.stem_type, pitch_shift)
 
         return clip
 
@@ -1257,6 +1912,7 @@ class AbletonService:
         bpm: float,
         als_file_path: Path,
         clip_color: Optional[str] = None,
+        pitch_shift: int = 0,
     ) -> None:
         """Add an arranger audio clip to a blank guide audio track."""
         events = track.find('.//MainSequencer/Sample/ArrangerAutomation/Events')
@@ -1264,7 +1920,14 @@ class AbletonService:
             logger.error("MainSequencer Sample ArrangerAutomation Events not found in guide track")
             return
 
-        clip = self._create_audio_clip_element(guide_wav, beat_position, bpm, als_file_path, clip_color)
+        clip = self._create_audio_clip_element(
+            guide_wav,
+            beat_position,
+            bpm,
+            als_file_path,
+            clip_color,
+            pitch_shift,
+        )
         existing_ids = [int(existing.get('Id', '0')) for existing in events.findall('AudioClip') if existing.get('Id', '0').isdigit()]
         clip.set('Id', str(max(existing_ids, default=0) + 1))
         events.append(clip)
@@ -1418,6 +2081,7 @@ class AbletonService:
         stem_type: str,
         track_color: Optional[str] = None,
         parent_group_id: Optional[int] = None,
+        send_indexes: Optional[List[int]] = None,
         insert_index: Optional[int] = None,
     ) -> Optional[ET.Element]:
         """Create a new blank audio track without depending on the current template's tracks."""
@@ -1427,7 +2091,7 @@ class AbletonService:
             new_track.set('Id', str(next_id))
             next_id += 1
 
-            self._resize_track_sends(new_track, self._get_template_send_count(tracks))
+            self._resize_track_sends(new_track, self._get_template_send_count(tracks), liveset)
 
             clip_slot_count = self._get_template_clip_slot_count(tracks)
             if clip_slot_count > 0:
@@ -1440,7 +2104,7 @@ class AbletonService:
             self._set_track_volume(new_track, 1.0)
             self._set_track_group_id(new_track, parent_group_id)
 
-            self._configure_generated_audio_track_routing(new_track, stem_type)
+            self._configure_generated_audio_track_routing(new_track, send_indexes or [])
 
             for selected_elem in new_track.iter('IsContentSelectedInDocument'):
                 selected_elem.set('Value', 'false')
@@ -1460,7 +2124,13 @@ class AbletonService:
 
     def _create_guide_audio_track(self, liveset: ET.Element, tracks: ET.Element, track_name: str) -> Optional[ET.Element]:
         """Create the shared guide audio track using the guide routing profile."""
-        return self._create_audio_track(liveset, tracks, track_name, 'guide')
+        return self._create_audio_track(
+            liveset,
+            tracks,
+            track_name,
+            'guide',
+            send_indexes=self._special_bus_send_indexes('guide'),
+        )
 
     def _create_group_track(
         self,
