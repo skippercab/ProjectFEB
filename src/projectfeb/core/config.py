@@ -7,6 +7,68 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from loguru import logger
 
+
+def default_output_buses() -> list[dict[str, Any]]:
+    """Return the default logical bus layout for generated Ableton returns."""
+    return [
+        {
+            'slot': 1,
+            'role': 'content',
+            'mode': 'mono',
+            'name': 'Perc',
+            'tags': ['drums', 'percussion', 'loops', 'perc'],
+        },
+        {
+            'slot': 2,
+            'role': 'content',
+            'mode': 'mono',
+            'name': 'Bass',
+            'tags': ['bass'],
+        },
+        {
+            'slot': 3,
+            'role': 'content',
+            'mode': 'mono',
+            'name': 'Lead',
+            'tags': ['lead_line'],
+        },
+        {
+            'slot': 4,
+            'role': 'content',
+            'mode': 'mono',
+            'name': 'Strings',
+            'tags': ['electric_guitar', 'acoustic_guitar', 'orchestra', 'guitars', 'strings'],
+        },
+        {
+            'slot': 5,
+            'role': 'content',
+            'mode': 'mono',
+            'name': 'Keys',
+            'tags': ['piano', 'synth', 'keys'],
+        },
+        {
+            'slot': 6,
+            'role': 'content',
+            'mode': 'mono',
+            'name': 'Vocals',
+            'tags': ['lead_vocal', 'bgvs', 'vocals'],
+        },
+        {
+            'slot': 7,
+            'role': 'click',
+            'mode': 'mono',
+            'name': 'Click',
+            'tags': [],
+        },
+        {
+            'slot': 8,
+            'role': 'guide',
+            'mode': 'mono',
+            'name': 'Guide',
+            'tags': [],
+        },
+    ]
+
 @dataclass
 class PlanningCenterConfig:
     """Planning Center Online configuration."""
@@ -30,6 +92,13 @@ class AbletonConfig:
     template_path: str = ""
     output_folder: str = ""
     version: str = "11.0_11300"  # Ableton 11.3.x
+    output_buses: list[dict[str, Any]] = None
+    enable_sub_master: bool = True
+    sub_master_bus_name: str = "Sub Master"
+
+    def __post_init__(self):
+        if self.output_buses is None:
+            self.output_buses = default_output_buses()
 
 @dataclass
 class Config:
