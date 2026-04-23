@@ -2,6 +2,8 @@
 
 import os
 import re
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -33,6 +35,8 @@ class StemMatch:
 
 class MultitracksService:
     """Service for discovering and matching Multitracks audio stems."""
+
+    FOLDER_TRAILING_MODIFIERS = {'sw'}
 
     # Common stem types and their variations - organized by Ableton template groups
     STEM_TYPES = {
@@ -68,6 +72,7 @@ class MultitracksService:
         """
         self.config = config
         self.stems_folder = Path(config.stems_folder) if config.stems_folder else None
+        self.extracted_archive_dirs: List[Path] = []
 
         # Build reverse mapping for stem type detection
         self.stem_keywords = {}
@@ -155,6 +160,19 @@ class MultitracksService:
                 song_stems = self._find_stems_in_song_folder(song_folder, clean_title, extensions)
                 stems.extend(song_stems)
 
+            # Process zip-only songs that do not already have an expanded folder
+            for zip_file in zip_files:
+                if zip_file.stem in folder_names:
+                    continue
+
+                extracted_song_folder = self._extract_zip_song_folder(zip_file)
+                if extracted_song_folder is None:
+                    continue
+
+                clean_title = self._extract_song_title_from_folder(extracted_song_folder.name)
+                song_stems = self._find_stems_in_song_folder(extracted_song_folder, clean_title, extensions)
+                stems.extend(song_stems)
+
             logger.info(f"Discovered {len(stems)} audio stem files across {len(folders_to_process)} song folders")
             if duplicates:
                 logger.warning(f"Skipped {len(duplicates)} .zip files that had matching folders")
@@ -187,6 +205,38 @@ class MultitracksService:
         # In the future, this method could be enhanced to prompt the user
         # via the UI (e.g., a dialog asking which to use)
         return folder
+
+    def _extract_zip_song_folder(self, zip_file: Path) -> Optional[Path]:
+        """Extract a zip-only song pack to a temp folder and return its song root."""
+        try:
+            extract_root = Path(tempfile.mkdtemp(prefix='projectfeb_stems_'))
+            self.extracted_archive_dirs.append(extract_root)
+
+            with zipfile.ZipFile(zip_file) as archive:
+                for member in archive.infolist():
+                    member_path = extract_root / member.filename
+                    resolved_path = member_path.resolve()
+                    if extract_root.resolve() not in resolved_path.parents and resolved_path != extract_root.resolve():
+                        logger.warning(f"Skipping unsafe zip member '{member.filename}' from {zip_file.name}")
+                        continue
+                    archive.extract(member, extract_root)
+
+            preferred_root = extract_root / zip_file.stem
+            if preferred_root.exists() and preferred_root.is_dir():
+                logger.info(f"Extracted zip-only song pack '{zip_file.name}' to {preferred_root}")
+                return preferred_root
+
+            child_dirs = [child for child in extract_root.iterdir() if child.is_dir() and child.name != '__MACOSX']
+            if len(child_dirs) == 1:
+                logger.info(f"Extracted zip-only song pack '{zip_file.name}' to {child_dirs[0]}")
+                return child_dirs[0]
+
+            logger.info(f"Extracted zip-only song pack '{zip_file.name}' to {extract_root}")
+            return extract_root
+
+        except Exception as exc:
+            logger.error(f"Failed to extract zip-only song pack '{zip_file}': {exc}")
+            return None
 
     def _parse_stem_file(self, file_path: Path) -> Optional[AudioStem]:
         """Parse a stem file to extract song title and stem type."""
@@ -331,6 +381,8 @@ class MultitracksService:
 
     def _find_stems_for_song(self, song_title: str, all_stems: List[AudioStem]) -> Optional[StemMatch]:
         """Find all stems for a specific song."""
+        requested_variants = self._song_title_match_variants(song_title)
+
         # Filter stems that might match this song
         candidate_stems = []
         for stem in all_stems:
@@ -338,9 +390,13 @@ class MultitracksService:
             if (stem.filename.lower().startswith('classic-') and stem.filename.lower().endswith('.aif')) or \
                stem.filename.lower().endswith('- click.wav') or stem.filename.lower() == 'click.wav':
                 continue
-                
-            # Use fuzzy matching on song titles
-            confidence = fuzz.ratio(song_title.lower(), stem.song_title.lower())
+
+            stem_variants = self._song_title_match_variants(stem.song_title)
+            confidence = max(
+                fuzz.ratio(requested_variant, stem_variant)
+                for requested_variant in requested_variants
+                for stem_variant in stem_variants
+            )
             if confidence >= 85:  # Minimum confidence threshold - increased to avoid false matches
                 stem.confidence = confidence / 100.0
                 candidate_stems.append(stem)
@@ -416,8 +472,10 @@ class MultitracksService:
         # Remove key information in brackets [A-G][b#]?[anything]
         title = re.sub(r'\s*\[[A-G][b#]?[\w]*\]', '', title)
 
-        # Remove trailing modifiers (like "sw" for switch)
-        title = re.sub(r'\s+\w{1,3}$', '', title)
+        # Remove known trailing modifiers (like "sw" for switch) but keep short real title words like "Joy"
+        parts = title.split()
+        if parts and parts[-1].lower() in self.FOLDER_TRAILING_MODIFIERS:
+            title = ' '.join(parts[:-1])
 
         # Clean up extra spaces
         title = re.sub(r'\s+', ' ', title).strip()
@@ -426,6 +484,27 @@ class MultitracksService:
         title = title.replace('&', 'and')
 
         return title.title()
+
+    def _song_title_match_variants(self, title: str) -> List[str]:
+        """Generate normalized title variants for fuzzy song-to-folder matching."""
+        variants: List[str] = []
+
+        def add_variant(value: str) -> None:
+            normalized = re.sub(r"[^a-z0-9]+", ' ', value.lower())
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            if normalized and normalized not in variants:
+                variants.append(normalized)
+
+        cleaned = title.replace('&', 'and')
+        add_variant(cleaned)
+
+        no_parenthetical = re.sub(r'\s*\([^)]*\)', '', cleaned).strip()
+        add_variant(no_parenthetical)
+
+        no_leading_article = re.sub(r'^(the|a|an)\s+', '', no_parenthetical, flags=re.IGNORECASE).strip()
+        add_variant(no_leading_article)
+
+        return variants
 
     def _find_stems_in_song_folder(self, song_folder: Path, song_title: str, extensions: List[str]) -> List[AudioStem]:
         """Find all stems within a song folder, handling different architectures."""

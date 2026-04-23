@@ -1,13 +1,17 @@
 """Ableton Live project file generation and manipulation service."""
 
 import gzip
+import json
+import subprocess
 import zipfile
 import wave
+import audioop
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
+from collections import defaultdict
 from loguru import logger
 import shutil
 import tempfile
@@ -15,6 +19,7 @@ import os
 import copy
 import zlib
 import re
+from itertools import combinations
 from tkinter import messagebox, ttk
 
 from ..core.config import AbletonConfig, default_output_buses
@@ -40,6 +45,21 @@ class AbletonService:
     """Service for working with Ableton Live project files."""
 
     KEY_OPTION_ORDER = ('AB', 'A', 'BB', 'B', 'C', 'DB', 'D', 'EB', 'E', 'F', 'GB', 'G')
+    GUIDE_CUE_WINDOW_SECONDS = 0.03
+    GUIDE_CUE_MIN_ACTIVE_SECONDS = 0.18
+    GUIDE_CUE_MERGE_GAP_SECONDS = 1.0
+    GUIDE_SECTION_MIN_DURATION_SECONDS = 2.0
+    GUIDE_SECTION_MIN_SUBSEGMENTS = 2
+    TEMPLATE_ARRANGEMENT_INTRO_BEATS = 20
+    GUIDE_CUE_MAX_EXTRA_MATCHES = 3
+    GUIDE_TRANSCRIPTION_MODEL = 'base.en'
+    GUIDE_TRANSCRIPTION_EXACT_MATCH_SCORE = 3
+    GUIDE_TRANSCRIPTION_WEAK_MATCH_SCORE = 1
+    GUIDE_TRANSCRIPTION_MIN_MATCH_RATIO = 0.55
+    GUIDE_TRANSCRIPTION_DUPLICATE_GAP_SECONDS = 4.0
+    GUIDE_TRANSCRIPTION_GUIDE_NATIVE_EXTRA_SECTIONS = 2
+    GUIDE_TRANSCRIPTION_MODIFIER_MERGE_GAP_SECONDS = 3.0
+    GUIDE_TRANSCRIPTION_TINY_FRAGMENT_SECONDS = 4.0
     KEY_DISPLAY_NAMES = {
         'AB': 'Ab',
         'A': 'A',
@@ -187,6 +207,10 @@ class AbletonService:
         self.blank_return_track_template = create_blank_return_track_template()
         self.audio_clip_template = create_audio_clip_template()
         self.source_key_cache: Dict[str, Optional[str]] = {}
+        self.guide_cue_cache: Dict[str, List[float]] = {}
+        self.guide_transcription_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self.guide_transcription_model = None
+        self.guide_transcription_unavailable = False
         self.output_buses = self._load_output_buses()
         self.active_return_buses: List[Dict[str, Any]] = []
         self.return_bus_indexes: Dict[str, int] = {}
@@ -561,9 +585,8 @@ class AbletonService:
         if plan_songs:
             # Use the ordered songs from the plan
             for song in plan_songs:
-                if song.title in stem_matches:
-                    key_suffix = f" ({song.key_name})" if song.key_name else ""
-                    songs_with_keys.append((song.title, key_suffix))
+                key_suffix = f" ({song.key_name})" if song.key_name else ""
+                songs_with_keys.append((song.title, key_suffix))
             logger.info(f"Using {len(songs_with_keys)} songs in API order")
         else:
             # Fallback to alphabetically sorted stems
@@ -750,7 +773,7 @@ class AbletonService:
 
             if midi_track_idx is not None and song.arrangement and song.arrangement.sequence:
                 logger.info(f"Adding MIDI clips for '{song.title}' with {len(song.arrangement.sequence)} sections")
-                self._add_midi_clips_for_song(tracks, midi_track_idx, song, song_start_beat)
+                self._add_midi_clips_for_song(tracks, midi_track_idx, song, song_start_beat, primary_guide_wav, bpm)
 
     def _add_tempo_mapping(self, liveset: ET.Element, plan_songs: List) -> None:
         """Add tempo automation events for each song based on their BPM values."""
@@ -1330,6 +1353,7 @@ class AbletonService:
         for pattern in (
             r'\[\s*([A-G](?:#|b)?(?:m|maj|min|minor|major)?)\s*\]',
             r'\(\s*([A-G](?:#|b)?(?:m|maj|min|minor|major)?)\s*\)',
+            r'\{\s*([A-G](?:#|b)?(?:m|maj|min|minor|major)?)\s*\}',
         ):
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match:
@@ -1358,13 +1382,22 @@ class AbletonService:
         scanned_directories: set[Path] = set()
         song_title = stems[0].song_title if stems else ''
 
+        def canonicalize_song_container_name(text: str) -> str:
+            text = re.sub(r'\s*[\(\[\{][^\)\]\}]*[\)\]\}]', '', text)
+            text = re.sub(r'\s+sw\b', '', text, flags=re.IGNORECASE)
+            return re.sub(r'[^a-z0-9]+', '', text.lower())
+
         def normalize_name(text: str) -> str:
             return re.sub(r'[^a-z0-9]+', '', text.lower())
 
-        normalized_song_title = normalize_name(song_title)
+        normalized_song_title = canonicalize_song_container_name(song_title)
 
         def is_song_container(path: Path) -> bool:
-            return bool(normalized_song_title) and normalized_song_title in normalize_name(path.name)
+            if not normalized_song_title:
+                return False
+
+            normalized_path_name = canonicalize_song_container_name(path.name)
+            return bool(normalized_path_name) and normalized_song_title == normalized_path_name
 
         for stem in stems:
             path_texts = [stem.filename, stem.path.stem]
@@ -1791,9 +1824,22 @@ class AbletonService:
         filename = stem.filename.lower()
         return 'click' in filename or filename.startswith('classic-')
 
+    def _is_suspicious_reference_guide(self, stem: AudioStem) -> bool:
+        """Ignore reference stems that are clearly source-separated instrument files, not real guides."""
+        filename = stem.filename.lower()
+        if 'split_by_lalalai' in filename:
+            return True
+        if 'reference' not in filename:
+            return False
+        return any(token in filename for token in ('bass', 'gtr', 'guitar', 'piano', 'drums', 'perc', 'keys'))
+
     def _select_primary_guide_stem(self, stems: List[AudioStem]) -> Optional[AudioStem]:
         """Prefer an actual guide file over click/cue variants."""
-        guide_stems = [stem for stem in stems if stem.stem_type == 'guide']
+        guide_stems = [
+            stem
+            for stem in stems
+            if stem.stem_type == 'guide' and not self._is_suspicious_reference_guide(stem)
+        ]
         if not guide_stems:
             return None
 
@@ -1824,11 +1870,33 @@ class AbletonService:
 
     def _get_wav_metadata(self, wav_path: Path) -> tuple[int, int, float]:
         """Return frame count, sample rate, and duration seconds for a WAV file."""
-        with wave.open(str(wav_path), 'rb') as wav_file:
-            frame_count = wav_file.getnframes()
-            sample_rate = wav_file.getframerate()
-        duration_seconds = frame_count / sample_rate if sample_rate else 0.0
-        return frame_count, sample_rate, duration_seconds
+        try:
+            with wave.open(str(wav_path), 'rb') as wav_file:
+                frame_count = wav_file.getnframes()
+                sample_rate = wav_file.getframerate()
+            duration_seconds = frame_count / sample_rate if sample_rate else 0.0
+            return frame_count, sample_rate, duration_seconds
+        except wave.Error:
+            probe = subprocess.run(
+                [
+                    'ffprobe',
+                    '-v', 'error',
+                    '-select_streams', 'a:0',
+                    '-show_entries', 'stream=sample_rate:format=duration',
+                    '-of', 'json',
+                    str(wav_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            metadata = json.loads(probe.stdout)
+            streams = metadata.get('streams') or []
+            stream = streams[0] if streams else {}
+            sample_rate = int(float(stream.get('sample_rate') or 0))
+            duration_seconds = float((metadata.get('format') or {}).get('duration') or 0.0)
+            frame_count = int(round(duration_seconds * sample_rate)) if sample_rate and duration_seconds else 0
+            return frame_count, sample_rate, duration_seconds
 
     def _create_audio_clip_element(
         self,
@@ -1903,6 +1971,938 @@ class AbletonService:
         self._apply_clip_warp_settings(clip, guide_wav.stem_type, pitch_shift)
 
         return clip
+
+    def _format_beat_value(self, value: float) -> str:
+        """Format beat-domain values while preserving fractional alignment."""
+        if abs(value - round(value)) < 0.0001:
+            return str(int(round(value)))
+        return f"{value:.6f}".rstrip('0').rstrip('.')
+
+    def _detect_guide_cue_starts(self, guide_wav: AudioStem) -> List[float]:
+        """Detect section-style cue phrase starts inside a guide WAV."""
+        return [phrase['start'] for phrase in self._detect_guide_cue_phrases(guide_wav)]
+
+    def _detect_guide_cue_phrases(self, guide_wav: AudioStem) -> List[Dict[str, Any]]:
+        """Detect merged guide cue phrases with start/end timing."""
+        cache_key = str(guide_wav.path)
+        if cache_key in self.guide_cue_cache:
+            return [{'start': start} for start in self.guide_cue_cache[cache_key]]
+
+        try:
+            with wave.open(str(guide_wav.path), 'rb') as wav_file:
+                sample_rate = wav_file.getframerate()
+                sample_width = wav_file.getsampwidth()
+                window_frames = max(1, int(sample_rate * self.GUIDE_CUE_WINDOW_SECONDS))
+                rms_values: List[int] = []
+
+                while True:
+                    frames = wav_file.readframes(window_frames)
+                    if not frames:
+                        break
+                    rms_values.append(audioop.rms(frames, sample_width))
+        except Exception as exc:
+            logger.warning(f"Failed to analyze guide cues for '{guide_wav.filename}': {exc}")
+            self.guide_cue_cache[cache_key] = []
+            return []
+
+        if not rms_values:
+            self.guide_cue_cache[cache_key] = []
+            return []
+
+        sorted_rms = sorted(rms_values)
+        median_rms = sorted_rms[len(sorted_rms) // 2]
+        percentile_90 = sorted_rms[min(len(sorted_rms) - 1, int(len(sorted_rms) * 0.9))]
+        active_threshold = max(250, int(median_rms * 3.0), int(percentile_90 * 0.18))
+        min_active_windows = max(1, int(self.GUIDE_CUE_MIN_ACTIVE_SECONDS / self.GUIDE_CUE_WINDOW_SECONDS))
+
+        raw_segments: List[Dict[str, float]] = []
+        active_start_index: Optional[int] = None
+        active_window_count = 0
+
+        for index, rms_value in enumerate(rms_values):
+            if rms_value >= active_threshold:
+                if active_start_index is None:
+                    active_start_index = index
+                active_window_count += 1
+                continue
+
+            if active_start_index is None:
+                continue
+
+            if active_window_count >= min_active_windows:
+                raw_segments.append({
+                    'start': active_start_index * self.GUIDE_CUE_WINDOW_SECONDS,
+                    'end': index * self.GUIDE_CUE_WINDOW_SECONDS,
+                })
+
+            active_start_index = None
+            active_window_count = 0
+
+        if active_start_index is not None and active_window_count >= min_active_windows:
+            raw_segments.append({
+                'start': active_start_index * self.GUIDE_CUE_WINDOW_SECONDS,
+                'end': len(rms_values) * self.GUIDE_CUE_WINDOW_SECONDS,
+            })
+
+        merged_phrases: List[Dict[str, float]] = []
+        for segment in raw_segments:
+            if merged_phrases and segment['start'] - merged_phrases[-1]['end'] <= self.GUIDE_CUE_MERGE_GAP_SECONDS:
+                merged_phrases[-1]['end'] = segment['end']
+                merged_phrases[-1]['subsegments'] += 1
+                continue
+
+            merged_phrases.append({
+                'start': segment['start'],
+                'end': segment['end'],
+                'subsegments': 1,
+            })
+
+        filtered_phrases = [
+            phrase
+            for phrase in merged_phrases
+            if (phrase['end'] - phrase['start']) >= self.GUIDE_SECTION_MIN_DURATION_SECONDS
+            and phrase['subsegments'] >= self.GUIDE_SECTION_MIN_SUBSEGMENTS
+        ]
+
+        logger.info(
+            f"Detected {len(filtered_phrases)} section-style guide cues in '{guide_wav.filename}' "
+            f"from {len(raw_segments)} speech bursts"
+        )
+        self.guide_cue_cache[cache_key] = [phrase['start'] for phrase in filtered_phrases]
+        return filtered_phrases
+
+    def _ensure_huggingface_cache_env(self) -> None:
+        """Work around invalid user-level HF cache paths by forcing a local cache directory."""
+        current_hf_home = os.getenv('HF_HOME')
+        if current_hf_home:
+            hf_home_path = Path(current_hf_home)
+            if hf_home_path.exists() and hf_home_path.is_dir():
+                return
+
+        fallback_hf_home = Path(tempfile.gettempdir()) / 'projectfeb-hf-home'
+        fallback_hf_home.mkdir(parents=True, exist_ok=True)
+        os.environ['HF_HOME'] = str(fallback_hf_home)
+        os.environ['HUGGINGFACE_HUB_CACHE'] = str(fallback_hf_home / 'hub')
+
+    def _get_guide_transcription_model(self):
+        """Lazily load the whisper model used for guide cue transcription."""
+        if self.guide_transcription_unavailable:
+            return None
+        if self.guide_transcription_model is not None:
+            return self.guide_transcription_model
+
+        try:
+            self._ensure_huggingface_cache_env()
+            from faster_whisper import WhisperModel
+
+            self.guide_transcription_model = WhisperModel(
+                self.GUIDE_TRANSCRIPTION_MODEL,
+                device='cpu',
+                compute_type='int8',
+            )
+            return self.guide_transcription_model
+        except Exception as exc:
+            logger.warning(f"Guide transcription unavailable: {exc}")
+            self.guide_transcription_unavailable = True
+            return None
+
+    def _guide_cue_family(self, cue_name: str) -> str:
+        """Reduce a spoken guide cue or section label to its canonical family."""
+        lower_name = cue_name.lower().strip()
+        if lower_name.startswith('bridge'):
+            return 'bridge'
+        if 'pre chorus' in lower_name or 'prechorus' in lower_name:
+            return 'pre chorus'
+        if 'post chorus' in lower_name or 'postchorus' in lower_name:
+            return 'post chorus'
+        if 'turnaround' in lower_name or lower_name.startswith('turn'):
+            return 'turnaround'
+        if lower_name in {'interlude', 'break', 'breakdown'} or 'breakdown' in lower_name:
+            return 'interlude'
+        if lower_name in {'instrumental'} or 'instr' in lower_name:
+            return 'instrumental'
+        if lower_name in {'ending', 'outro', 'end', 'big ending'} or 'ending' in lower_name or 'outro' in lower_name:
+            return 'ending'
+        if lower_name in {'tag', 'refrain', 'vamp'}:
+            return 'tag'
+        if 'chorus' in lower_name:
+            return 'chorus'
+        if 'intro' in lower_name:
+            return 'intro'
+        if 'verse' in lower_name:
+            return 'verse'
+        return lower_name
+
+    def _extract_guide_transcript_modifiers(self, text: str) -> List[str]:
+        """Extract performance-direction modifiers that should survive alongside guide labels."""
+        lower_text = text.lower()
+        modifier_patterns = [
+            ('all in', r'\ball\s*in\b'),
+            ('drums in', r'\bdrums\s*in\b'),
+            ('breakdown', r'\bbreak\s*down\b|\bbreakdown\b'),
+            ('break', r'\bbreak\b'),
+            ('build', r'\bslowly\s*build\b|\bcontinue\s*to\s*build\b|\bbuild\b'),
+            ('softly', r'\bsoftly\b'),
+            ('bass', r'\bbass\b|\bbase\b'),
+        ]
+
+        modifiers: List[str] = []
+        for modifier, pattern in modifier_patterns:
+            if re.search(pattern, lower_text) and modifier not in modifiers:
+                modifiers.append(modifier)
+        return modifiers
+
+    def _decorate_guide_transcribed_section(self, section: Dict[str, Any], text: str) -> Dict[str, Any]:
+        """Attach normalized family and modifier context to a transcribed guide section."""
+        decorated_section = dict(section)
+        decorated_section['family'] = self._guide_cue_family(section['label'])
+        decorated_section['modifiers'] = self._extract_guide_transcript_modifiers(text)
+        return decorated_section
+
+    def _find_guide_transcript_label_matches(self, text: str) -> List[tuple[int, int, str]]:
+        """Find ordered canonical section labels and their spans in transcribed guide text."""
+        lower_text = text.lower()
+        separator = r'[\s,.;:-]*'
+
+        patterns = [
+            ('turnaround', r'\bturn\s*around\b|\bturnaround\b'),
+            ('tag', r'\btag\b|\brefrain\b'),
+            ('pre chorus', rf'\bpre{separator}chorus(?:{separator}(?:1|one|2|two|3|three|4|four))?\b|\bprechorus(?:{separator}(?:1|one|2|two|3|three|4|four))?\b'),
+            ('post chorus', rf'\bpost{separator}chorus(?:{separator}(?:1|one|2|two|3|three|4|four))?\b|\bpostchorus(?:{separator}(?:1|one|2|two|3|three|4|four))?\b'),
+            ('interlude', r'\bbreak\s*down\b|\bbreakdown\b|\bbreak\b|\binterlude\b'),
+            ('bridge 1', rf'\bbridge{separator}(?:1|one)\b'),
+            ('bridge 2', rf'\bbridge{separator}(?:2|two)\b'),
+            ('bridge 3', rf'\bbridge{separator}(?:3|three)\b'),
+            ('bridge', r'\bbridge\b'),
+            ('instrumental', r'\binstrumental\b'),
+            ('ending', r'\bbig\s*ending\b|\bending\b|\boutro\b|\bend\b'),
+            ('chorus', rf'\bchorus(?:{separator}(?:1|one|2|two|3|three))?\b'),
+            ('vamp', r'\bvamp\b'),
+            ('intro', r'\bintro\b'),
+            ('verse', rf'\bverse(?:{separator}(?:1|one|2|two|3|three))?\b'),
+        ]
+
+        matches: List[tuple[int, int, str]] = []
+        occupied_spans: List[tuple[int, int]] = []
+        for label, pattern in patterns:
+            for match in re.finditer(pattern, lower_text):
+                start, end = match.span()
+                if any(start < existing_end and end > existing_start for existing_start, existing_end in occupied_spans):
+                    continue
+                occupied_spans.append((start, end))
+                matches.append((start, end, label))
+
+        matches.sort(key=lambda item: (item[0], item[1]))
+        return matches
+
+    def _extract_guide_word_timed_labels(self, segment) -> List[Dict[str, Any]]:
+        """Extract canonical guide labels from word timestamps when available."""
+        words = getattr(segment, 'words', None) or []
+        if not words:
+            return []
+
+        normalized_words: List[Dict[str, Any]] = []
+        for word in words:
+            token = (word.word or '').strip()
+            if not token:
+                continue
+            normalized = token.lower().strip('.,!?;:')
+            if not normalized:
+                continue
+            normalized_words.append({
+                'word': normalized,
+                'start': float(word.start),
+                'end': float(word.end),
+            })
+
+        labels: List[Dict[str, Any]] = []
+        index = 0
+        while index < len(normalized_words):
+            current = normalized_words[index]
+            word = current['word']
+            next_word = normalized_words[index + 1]['word'] if index + 1 < len(normalized_words) else ''
+
+            label: Optional[str] = None
+            consumed = 1
+            if word == 'turnaround' or (word == 'turn' and next_word == 'around'):
+                label = 'turnaround'
+                consumed = 2 if word == 'turn' and next_word == 'around' else 1
+            elif word in {'tag', 'refrain'}:
+                label = 'tag'
+            elif word == 'prechorus' or (word == 'pre' and next_word == 'chorus'):
+                label = 'pre chorus'
+                consumed = 2 if word == 'pre' and next_word == 'chorus' else 1
+            elif word == 'postchorus' or (word == 'post' and next_word == 'chorus'):
+                label = 'post chorus'
+                consumed = 2 if word == 'post' and next_word == 'chorus' else 1
+            elif word == 'interlude':
+                label = 'interlude'
+            elif word == 'break' or word == 'breakdown' or (word == 'break' and next_word == 'down'):
+                label = 'interlude'
+                consumed = 2 if word == 'break' and next_word == 'down' else 1
+            elif word == 'bridge':
+                number_word = next_word
+                if number_word in {'1', 'one'}:
+                    label = 'bridge 1'
+                    consumed = 2
+                elif number_word in {'2', 'two'}:
+                    label = 'bridge 2'
+                    consumed = 2
+                elif number_word in {'3', 'three'}:
+                    label = 'bridge 3'
+                    consumed = 2
+                else:
+                    label = 'bridge'
+            elif word == 'instrumental':
+                label = 'instrumental'
+            elif word == 'big' and next_word == 'ending':
+                label = 'ending'
+                consumed = 2
+            elif word in {'ending', 'outro', 'end'}:
+                label = 'ending'
+            elif word == 'chorus':
+                label = 'chorus'
+            elif word == 'vamp':
+                label = 'vamp'
+            elif word == 'intro':
+                label = 'intro'
+            elif word == 'verse':
+                label = 'verse'
+
+            if label is not None:
+                end_index = min(len(normalized_words) - 1, index + consumed - 1)
+                labels.append({
+                    'label': label,
+                    'start_seconds': current['start'],
+                    'end_seconds': normalized_words[end_index]['end'],
+                })
+                index += consumed
+                continue
+
+            index += 1
+
+        return labels
+
+    def _extract_guide_transcript_labels(self, text: str) -> List[str]:
+        """Extract ordered canonical section labels from transcribed guide text."""
+        matches = self._find_guide_transcript_label_matches(text)
+        return [label for _, _, label in matches]
+
+    def _canonicalize_guide_transcript_label(self, text: str) -> Optional[str]:
+        """Choose the best single section label from transcribed guide cue text."""
+        labels = self._extract_guide_transcript_labels(text)
+        if not labels:
+            return None
+
+        for label in labels:
+            if self._section_family_from_name(label) != 'interlude':
+                return label
+
+        return labels[0]
+
+    def _transcribe_guide_phrase_sections(self, guide_wav: AudioStem) -> List[Dict[str, Any]]:
+        """Transcribe spoken guide cue phrases into ordered section segments."""
+        cache_key = f"phrases::{guide_wav.path}"
+        if cache_key in self.guide_transcription_cache:
+            return self.guide_transcription_cache[cache_key]
+
+        model = self._get_guide_transcription_model()
+        if model is None:
+            self.guide_transcription_cache[cache_key] = []
+            return []
+
+        cue_phrases = self._detect_guide_cue_phrases(guide_wav)
+        if not cue_phrases:
+            self.guide_transcription_cache[cache_key] = []
+            return []
+
+        guide_sections: List[Dict[str, Any]] = []
+        padding_seconds = 0.25
+        try:
+            with wave.open(str(guide_wav.path), 'rb') as wav_file:
+                params = wav_file.getparams()
+                sample_rate = wav_file.getframerate()
+                sample_width = wav_file.getsampwidth()
+                channels = wav_file.getnchannels()
+                all_audio = wav_file.readframes(wav_file.getnframes())
+        except Exception as exc:
+            logger.warning(f"Failed to load guide audio for cue transcription '{guide_wav.filename}': {exc}")
+            self.guide_transcription_cache[cache_key] = []
+            return []
+
+        bytes_per_frame = sample_width * channels
+        total_frames = len(all_audio) // bytes_per_frame if bytes_per_frame else 0
+
+        for phrase in cue_phrases:
+            start_frame = max(0, int((phrase['start'] - padding_seconds) * sample_rate))
+            end_frame = min(total_frames, int((phrase['end'] + padding_seconds) * sample_rate))
+            snippet_audio = all_audio[start_frame * bytes_per_frame:end_frame * bytes_per_frame]
+            if not snippet_audio:
+                continue
+
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as temp_wav:
+                    with wave.open(temp_wav.name, 'wb') as temp_file:
+                        temp_file.setparams(params)
+                        temp_file.writeframes(snippet_audio)
+
+                    segments, _ = model.transcribe(temp_wav.name, language='en', vad_filter=True)
+            except Exception as exc:
+                logger.warning(f"Failed to transcribe guide cue phrase for '{guide_wav.filename}': {exc}")
+                continue
+
+            text = ' '.join(segment.text.strip() for segment in segments if segment.text and segment.text.strip()).strip()
+            if not text:
+                continue
+
+            label = self._canonicalize_guide_transcript_label(text)
+            if label is None and not guide_sections and phrase['start'] <= 16.0:
+                label = 'intro'
+            if label is None:
+                continue
+
+            guide_sections.append(self._decorate_guide_transcribed_section({
+                'start_seconds': phrase['start'],
+                'end_seconds': phrase['end'],
+                'label': label,
+                'text': text,
+            }, text))
+
+        logger.info(f"Transcribed {len(guide_sections)} guide sections from '{guide_wav.filename}'")
+        self.guide_transcription_cache[cache_key] = guide_sections
+        return guide_sections
+
+    def _transcribe_guide_whole_file_sections(self, guide_wav: AudioStem) -> List[Dict[str, Any]]:
+        """Transcribe the full guide WAV and extract ordered labels from each segment."""
+        cache_key = f"whole::{guide_wav.path}"
+        if cache_key in self.guide_transcription_cache:
+            return self.guide_transcription_cache[cache_key]
+
+        model = self._get_guide_transcription_model()
+        if model is None:
+            self.guide_transcription_cache[cache_key] = []
+            return []
+
+        try:
+            segments, _ = model.transcribe(
+                str(guide_wav.path),
+                language='en',
+                vad_filter=True,
+                word_timestamps=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to transcribe full guide for '{guide_wav.filename}': {exc}")
+            self.guide_transcription_cache[cache_key] = []
+            return []
+
+        guide_sections: List[Dict[str, Any]] = []
+        for segment in segments:
+            text = segment.text.strip()
+            if not text:
+                continue
+
+            word_timed_labels = self._extract_guide_word_timed_labels(segment)
+            if not word_timed_labels and not guide_sections and float(segment.start) <= 8.0:
+                word_timed_labels = [{
+                    'label': 'intro',
+                    'start_seconds': float(segment.start),
+                    'end_seconds': max(float(segment.start) + 0.25, float(segment.end)),
+                }]
+            if not word_timed_labels:
+                continue
+
+            for label_entry in word_timed_labels:
+                guide_sections.append(self._decorate_guide_transcribed_section({
+                    'start_seconds': label_entry['start_seconds'],
+                    'end_seconds': label_entry['end_seconds'],
+                    'label': label_entry['label'],
+                    'text': text,
+                }, text))
+
+        logger.info(f"Transcribed {len(guide_sections)} whole-file guide sections from '{guide_wav.filename}'")
+        self.guide_transcription_cache[cache_key] = guide_sections
+        return guide_sections
+
+    def _guide_transcription_alignment_score(self, target_family: str, observed_family: str) -> int:
+        """Return an alignment score between a PCO section family and a transcribed guide family."""
+        if target_family == observed_family:
+            return self.GUIDE_TRANSCRIPTION_EXACT_MATCH_SCORE
+
+        if target_family == 'tag' and observed_family == 'interlude':
+            return self.GUIDE_TRANSCRIPTION_WEAK_MATCH_SCORE
+
+        return 0
+
+    def _guide_transcription_terminal_bonus(self, target_family: str, observed_family: str) -> int:
+        """Prefer preserving final guide cues like Tag or Ending over duplicate mid-song labels."""
+        if target_family not in {'tag', 'ending'}:
+            return 0
+
+        if target_family == observed_family:
+            return self.GUIDE_TRANSCRIPTION_EXACT_MATCH_SCORE
+
+        if target_family == 'tag' and observed_family in {'interlude', 'vamp'}:
+            return self.GUIDE_TRANSCRIPTION_EXACT_MATCH_SCORE
+
+        return 0
+
+    def _normalize_guide_transcribed_sections(
+        self,
+        sections: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Collapse near-duplicate guide labels that come from the same spoken phrase."""
+        normalized_sections: List[Dict[str, Any]] = []
+        for section in sections:
+            if not normalized_sections:
+                normalized_sections.append(dict(section))
+                continue
+
+            previous = normalized_sections[-1]
+            previous_family = self._section_family_from_name(previous['label'])
+            current_family = self._section_family_from_name(section['label'])
+            start_gap = float(section['start_seconds']) - float(previous['start_seconds'])
+            if current_family == previous_family and start_gap <= self.GUIDE_TRANSCRIPTION_DUPLICATE_GAP_SECONDS:
+                previous['end_seconds'] = max(float(previous.get('end_seconds', 0.0)), float(section.get('end_seconds', 0.0)))
+                continue
+
+            normalized_sections.append(dict(section))
+
+        return normalized_sections
+
+    def _cleanup_guide_transcribed_sections(
+        self,
+        sections: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Merge ultra-close modifier-only cues back into the surrounding structural section."""
+        cleaned_sections: List[Dict[str, Any]] = []
+        for section in sections:
+            current = dict(section)
+            current_family = self._section_family_from_name(current['label'])
+            if not cleaned_sections:
+                cleaned_sections.append(current)
+                continue
+
+            previous = cleaned_sections[-1]
+            previous_family = self._section_family_from_name(previous['label'])
+            current_text = (current.get('text') or '').strip().lower()
+            previous_text = (previous.get('text') or '').strip().lower()
+            start_gap = float(current['start_seconds']) - float(previous['start_seconds'])
+            current_modifiers = set(current.get('modifiers', []))
+
+            if (
+                current_family == 'interlude'
+                and previous_family not in {'interlude', 'ending'}
+                and current_modifiers.intersection({'breakdown', 'break', 'build', 'all in', 'drums in', 'softly', 'bass'})
+                and start_gap <= self.GUIDE_TRANSCRIPTION_MODIFIER_MERGE_GAP_SECONDS
+                and current_text
+                and current_text == previous_text
+            ):
+                previous_modifiers = list(previous.get('modifiers', []))
+                for modifier in current.get('modifiers', []):
+                    if modifier not in previous_modifiers:
+                        previous_modifiers.append(modifier)
+                previous['modifiers'] = previous_modifiers
+                previous['end_seconds'] = max(
+                    float(previous.get('end_seconds', 0.0)),
+                    float(current.get('end_seconds', 0.0)),
+                )
+                continue
+
+            cleaned_sections.append(current)
+
+        structurally_cleaned_sections: List[Dict[str, Any]] = []
+        for index, section in enumerate(cleaned_sections):
+            current = dict(section)
+            current_family = self._section_family_from_name(current['label'])
+            if not structurally_cleaned_sections:
+                structurally_cleaned_sections.append(current)
+                continue
+
+            previous = structurally_cleaned_sections[-1]
+            previous_family = self._section_family_from_name(previous['label'])
+            next_section = cleaned_sections[index + 1] if index + 1 < len(cleaned_sections) else None
+            current_text = (current.get('text') or '').strip().lower()
+            previous_text = (previous.get('text') or '').strip().lower()
+            current_modifiers = set(current.get('modifiers', []))
+
+            current_duration = None
+            if next_section is not None:
+                current_duration = float(next_section['start_seconds']) - float(current['start_seconds'])
+
+            if (
+                current_family == 'interlude'
+                and next_section is not None
+                and previous_family not in {'interlude', 'ending', 'chorus'}
+                and current_duration is not None
+                and current_duration <= self.GUIDE_TRANSCRIPTION_TINY_FRAGMENT_SECONDS
+                and current_modifiers.intersection({'breakdown', 'break', 'build', 'all in', 'drums in', 'softly', 'bass'})
+                and current_text
+                and current_text == previous_text
+            ):
+                previous_modifiers = list(previous.get('modifiers', []))
+                for modifier in current.get('modifiers', []):
+                    if modifier not in previous_modifiers:
+                        previous_modifiers.append(modifier)
+                previous['modifiers'] = previous_modifiers
+                previous['end_seconds'] = max(
+                    float(previous.get('end_seconds', 0.0)),
+                    float(current.get('end_seconds', 0.0)),
+                )
+                continue
+
+            structurally_cleaned_sections.append(current)
+
+        return structurally_cleaned_sections
+
+    def _align_transcribed_sections_to_sequence(
+        self,
+        sequence: List[str],
+        sections: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], float]:
+        """Align transcribed guide sections to the target PCO arrangement sequence."""
+        if not sequence or not sections:
+            return [], 0.0
+
+        target_families = [self._section_family_from_name(name) for name in sequence]
+        observed_families = [self._section_family_from_name(section['label']) for section in sections]
+        target_count = len(target_families)
+        observed_count = len(observed_families)
+
+        scores = [[0] * (observed_count + 1) for _ in range(target_count + 1)]
+        moves = [[''] * (observed_count + 1) for _ in range(target_count + 1)]
+
+        for target_index in range(1, target_count + 1):
+            for observed_index in range(1, observed_count + 1):
+                best_score = scores[target_index - 1][observed_index]
+                best_move = 'up'
+
+                if scores[target_index][observed_index - 1] > best_score:
+                    best_score = scores[target_index][observed_index - 1]
+                    best_move = 'left'
+
+                match_score = self._guide_transcription_alignment_score(
+                    target_families[target_index - 1],
+                    observed_families[observed_index - 1],
+                )
+                if match_score > 0 and target_index == target_count:
+                    match_score += self._guide_transcription_terminal_bonus(
+                        target_families[target_index - 1],
+                        observed_families[observed_index - 1],
+                    )
+                diagonal_score = scores[target_index - 1][observed_index - 1] + match_score
+                if match_score > 0 and diagonal_score > best_score:
+                    best_score = diagonal_score
+                    best_move = 'diag'
+
+                scores[target_index][observed_index] = best_score
+                moves[target_index][observed_index] = best_move
+
+        aligned_sections: List[Dict[str, Any]] = []
+        target_index = target_count
+        observed_index = observed_count
+        while target_index > 0 and observed_index > 0:
+            move = moves[target_index][observed_index]
+            if move == 'diag':
+                section = dict(sections[observed_index - 1])
+                section['target_name'] = sequence[target_index - 1]
+                aligned_sections.append(section)
+                target_index -= 1
+                observed_index -= 1
+            elif move == 'left':
+                observed_index -= 1
+            else:
+                target_index -= 1
+
+        aligned_sections.reverse()
+        max_score = target_count * self.GUIDE_TRANSCRIPTION_EXACT_MATCH_SCORE
+        score_ratio = (scores[target_count][observed_count] / max_score) if max_score else 0.0
+        return aligned_sections, score_ratio
+
+    def _transcribe_guide_sections(self, guide_wav: AudioStem, sequence: List[str]) -> List[Dict[str, Any]]:
+        """Choose the best transcription strategy for the guide WAV against the target sequence."""
+        phrase_sections = self._transcribe_guide_phrase_sections(guide_wav)
+        whole_file_sections = self._cleanup_guide_transcribed_sections(
+            self._normalize_guide_transcribed_sections(
+                self._transcribe_guide_whole_file_sections(guide_wav)
+            )
+        )
+
+        if whole_file_sections:
+            logger.info(
+                f"Using full guide-native transcription for '{guide_wav.filename}' "
+                f"with {len(whole_file_sections)} sections"
+            )
+            return whole_file_sections
+
+        candidates = [
+            ('phrase', phrase_sections),
+            ('whole-file', whole_file_sections),
+        ]
+
+        best_sections: List[Dict[str, Any]] = []
+        best_mode: Optional[str] = None
+        best_ratio = 0.0
+        best_count = 0
+
+        for mode, sections in candidates:
+            aligned_sections, score_ratio = self._align_transcribed_sections_to_sequence(sequence, sections)
+            if not aligned_sections:
+                continue
+
+            if (
+                score_ratio > best_ratio
+                or (score_ratio == best_ratio and len(aligned_sections) > best_count)
+            ):
+                best_sections = aligned_sections
+                best_mode = mode
+                best_ratio = score_ratio
+                best_count = len(aligned_sections)
+
+        if best_sections and best_ratio >= self.GUIDE_TRANSCRIPTION_MIN_MATCH_RATIO:
+            if best_mode == 'phrase':
+                best_sections = phrase_sections
+            elif (
+                best_mode == 'whole-file'
+                and len(whole_file_sections) > len(best_sections)
+                and len(whole_file_sections) <= len(sequence) + self.GUIDE_TRANSCRIPTION_GUIDE_NATIVE_EXTRA_SECTIONS
+            ):
+                best_sections = whole_file_sections
+                logger.info(
+                    f"Using guide-native whole-file section order for '{guide_wav.filename}' "
+                    f"because the guide contains {len(whole_file_sections)} coherent sections versus "
+                    f"{len(best_sections)} PCO-aligned matches"
+                )
+
+            logger.info(
+                f"Using {best_mode} guide transcription for '{guide_wav.filename}' "
+                f"with match ratio {best_ratio:.2f} ({len(best_sections)} returned sections)"
+            )
+            return best_sections
+
+        return []
+
+    def _section_family_from_name(self, section_name: str) -> str:
+        """Reduce a section name to its broad family for numbering reuse."""
+        return self._guide_cue_family(section_name)
+
+    def _display_name_for_guide_label(self, label: str, modifiers: Optional[List[str]] = None) -> str:
+        """Build a readable fallback display label from a canonical guide label."""
+        modifiers = modifiers or []
+        family = self._guide_cue_family(label)
+        if label.startswith('bridge '):
+            return label.title()
+        if family == 'turnaround':
+            return 'Turnaround'
+        if family == 'pre chorus':
+            return 'Pre Chorus'
+        if family == 'post chorus':
+            return 'Post Chorus'
+        if family == 'interlude':
+            if 'breakdown' in modifiers or 'break' in modifiers:
+                return 'Breakdown'
+            if 'drums in' in modifiers:
+                return 'Drums In'
+            if 'all in' in modifiers:
+                return 'All In'
+            return 'Interlude'
+        if family == 'tag':
+            return 'Tag'
+        if family == 'instrumental':
+            return 'Instrumental'
+        if family == 'ending':
+            return 'Ending'
+        if family == 'chorus':
+            return 'Chorus'
+        if family == 'intro':
+            return 'Intro'
+        if family == 'verse':
+            return 'Verse'
+        return label.title()
+
+    def _guide_section_name_match_score(self, section: Dict[str, Any], target_name: str) -> int:
+        """Score how well a guide-native section should borrow the next PCO display name."""
+        observed_family = self._section_family_from_name(section['label'])
+        target_family = self._section_family_from_name(target_name)
+        if observed_family == target_family:
+            return 3
+
+        modifiers = set(section.get('modifiers', []))
+        if target_family == 'tag' and observed_family in {'chorus', 'interlude'}:
+            if modifiers.intersection({'all in', 'breakdown', 'build', 'drums in'}):
+                return 2
+
+        return 0
+
+    def _resolve_guide_section_names(self, sequence: List[str], sections: List[Dict[str, Any]]) -> List[str]:
+        """Use PCO names only to decorate generic guide labels like Verse/Chorus numbering."""
+        resolved_names: List[str] = []
+        sequence_index = 0
+
+        for section in sections:
+            label = section['label']
+            modifiers = section.get('modifiers', [])
+
+            if sequence_index < len(sequence):
+                candidate_name = sequence[sequence_index]
+                if self._guide_section_name_match_score(section, candidate_name) > 0:
+                    resolved_name = candidate_name
+                    sequence_index += 1
+                else:
+                    resolved_name = self._display_name_for_guide_label(label, modifiers)
+            else:
+                resolved_name = self._display_name_for_guide_label(label, modifiers)
+
+            resolved_names.append(resolved_name)
+
+        return resolved_names
+
+    def _get_guide_aligned_section_timings(
+        self,
+        guide_wav: Optional[AudioStem],
+        sequence: List[str],
+        beat_position: float,
+        bpm: float,
+    ) -> Optional[List[Dict[str, float]]]:
+        """Build section timings from guide cues when the cue count matches the sequence count."""
+        if guide_wav is None or not sequence or bpm <= 0:
+            return None
+
+        transcribed_sections = self._transcribe_guide_sections(guide_wav, sequence)
+        if transcribed_sections:
+            _, _, duration_seconds = self._get_wav_metadata(guide_wav.path)
+            song_end_beat = beat_position + ((duration_seconds * bpm) / 60.0)
+            resolved_names = None
+            if any('target_name' not in section for section in transcribed_sections):
+                resolved_names = self._resolve_guide_section_names(
+                    sequence,
+                    transcribed_sections,
+                )
+
+            section_timings: List[Dict[str, float]] = []
+            for index, section in enumerate(transcribed_sections):
+                section_start = beat_position + ((section['start_seconds'] * bpm) / 60.0)
+                next_start = (
+                    beat_position + ((transcribed_sections[index + 1]['start_seconds'] * bpm) / 60.0)
+                    if index + 1 < len(transcribed_sections)
+                    else song_end_beat
+                )
+                section_timings.append({
+                    'name': (
+                        section['target_name']
+                        if 'target_name' in section
+                        else resolved_names[index]
+                    ),
+                    'start': section_start,
+                    'duration': max(1.0, next_start - section_start),
+                })
+
+            logger.info(f"Using transcribed guide timeline for '{guide_wav.filename}'")
+            return section_timings
+
+        cue_starts_seconds = self._detect_guide_cue_starts(guide_wav)
+        song_content_start = beat_position + self.TEMPLATE_ARRANGEMENT_INTRO_BEATS
+        cue_start_beats = [
+            beat_position + ((start_seconds * bpm) / 60.0)
+            for start_seconds in cue_starts_seconds
+        ]
+        cue_start_beats = [cue for cue in cue_start_beats if cue >= song_content_start - 1.0]
+
+        _, _, duration_seconds = self._get_wav_metadata(guide_wav.path)
+        song_end_beat = beat_position + ((duration_seconds * bpm) / 60.0)
+
+        selected_starts = self._select_section_start_beats(sequence, cue_start_beats, song_end_beat)
+        if selected_starts is None:
+            logger.info(
+                f"Guide cue count mismatch for '{guide_wav.filename}': detected {len(cue_starts_seconds)} "
+                f"cues ({len(cue_start_beats)} after intro trim) for {len(sequence)} sections; "
+                "falling back to even MIDI spacing"
+            )
+            return None
+
+        section_timings: List[Dict[str, float]] = []
+        for index, section_name in enumerate(sequence):
+            section_start = selected_starts[index]
+            next_start = selected_starts[index + 1] if index + 1 < len(selected_starts) else song_end_beat
+            section_timings.append({
+                'name': section_name,
+                'start': section_start,
+                'duration': max(1.0, next_start - section_start),
+            })
+
+        logger.info(f"Using cue-detected guide timing fallback for '{guide_wav.filename}'")
+        return section_timings
+
+    def _select_section_start_beats(
+        self,
+        sequence: List[str],
+        cue_start_beats: List[float],
+        song_end_beat: float,
+    ) -> Optional[List[float]]:
+        """Choose the best cue-start subset for the target section sequence."""
+        required_count = len(sequence)
+        available_count = len(cue_start_beats)
+        if available_count < required_count:
+            return None
+
+        if available_count == required_count:
+            return cue_start_beats
+
+        extra_count = available_count - required_count
+        if extra_count > self.GUIDE_CUE_MAX_EXTRA_MATCHES:
+            return None
+
+        best_selection: Optional[List[float]] = None
+        best_score: Optional[float] = None
+
+        for selection_indexes in combinations(range(available_count), required_count):
+            starts = [cue_start_beats[index] for index in selection_indexes]
+            score = self._score_section_start_selection(sequence, starts, song_end_beat)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_selection = starts
+
+        return best_selection
+
+    def _score_section_start_selection(
+        self,
+        sequence: List[str],
+        starts: List[float],
+        song_end_beat: float,
+    ) -> float:
+        """Score a candidate cue subset against section-name duration expectations."""
+        durations = [
+            (starts[index + 1] if index + 1 < len(starts) else song_end_beat) - starts[index]
+            for index in range(len(starts))
+        ]
+
+        score = 0.0
+        for section_name, duration in zip(sequence, durations):
+            min_beats, max_beats, target_beats = self._expected_section_duration_profile(section_name)
+            rounded_duration = round(duration / 4.0) * 4.0
+            score += abs(duration - rounded_duration)
+            score += abs(duration - target_beats) * 0.15
+
+            if duration < min_beats:
+                score += (min_beats - duration) * 5.0
+            if duration > max_beats:
+                score += (duration - max_beats) * 3.0
+
+        return score
+
+    def _expected_section_duration_profile(self, section_name: str) -> tuple[float, float, float]:
+        """Return preferred duration bounds for a section label in beats."""
+        section_lower = section_name.lower()
+
+        if 'ending' in section_lower or 'outro' in section_lower:
+            return (4.0, 20.0, 12.0)
+        if 'turnaround' in section_lower or 'turn' in section_lower or 'vamp' in section_lower or 'tag' in section_lower:
+            return (4.0, 16.0, 8.0)
+        if 'intro' in section_lower:
+            return (8.0, 32.0, 16.0)
+        if 'instrumental' in section_lower or 'interlude' in section_lower or 'bridge' in section_lower:
+            return (8.0, 40.0, 24.0)
+
+        return (8.0, 40.0, 24.0)
 
     def _add_audio_clip_to_track(
         self,
@@ -2176,7 +3176,15 @@ class AbletonService:
             logger.error(f"Failed to create group track '{track_name}': {e}", exc_info=True)
             return None
 
-    def _add_midi_clips_for_song(self, tracks: ET.Element, midi_track_idx: int, song, beat_position: float) -> None:
+    def _add_midi_clips_for_song(
+        self,
+        tracks: ET.Element,
+        midi_track_idx: int,
+        song,
+        beat_position: float,
+        guide_wav: Optional[AudioStem] = None,
+        bpm: float = 120,
+    ) -> None:
         """Create MIDI clips in ArrangerAutomation/Events for arrangement playback."""
         if not song.arrangement or not song.arrangement.sequence:
             logger.debug(f"No arrangement sequence for {song.title}")
@@ -2208,13 +3216,28 @@ class AbletonService:
         if events is None:
             logger.warning("Events not found, creating it")
             events = ET.SubElement(arranger_automation, "Events")
-        
-        # Estimate beats per section (allocate remaining time after template intro)
-        # Template has COUNT (0-4) and INTRO (4-20), so real content starts at beat 20
-        # Allocate remaining 220 beats (240 - 20) for arrangement sections
-        template_intro_duration = 20  # beats 4-20
-        available_song_duration = 240 - template_intro_duration
-        beats_per_section = available_song_duration / num_sections if num_sections > 0 else available_song_duration
+
+        section_timings = self._get_guide_aligned_section_timings(guide_wav, sequence, beat_position, bpm)
+        if section_timings is None:
+            template_intro_duration = self.TEMPLATE_ARRANGEMENT_INTRO_BEATS
+            available_song_duration = 240 - template_intro_duration
+            beats_per_section = available_song_duration / num_sections if num_sections > 0 else available_song_duration
+            section_timings = [
+                {
+                    'name': section_name,
+                    'start': beat_position + template_intro_duration + (section_idx * beats_per_section),
+                    'duration': beats_per_section,
+                }
+                for section_idx, section_name in enumerate(sequence)
+            ]
+
+            logger.info(f"Adding {num_sections} evenly-spaced MIDI clips for '{song.title}'")
+            logger.info(
+                f"  Song starts at beat {beat_position}, arrangement sections start at beat {beat_position + template_intro_duration}"
+            )
+            logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration} available beats")
+        else:
+            logger.info(f"Adding {len(section_timings)} guide-aligned MIDI clips for '{song.title}'")
         
         # Get the highest existing MidiClip ID
         existing_clips = events.findall("MidiClip")
@@ -2225,29 +3248,24 @@ class AbletonService:
                 max_id = max(max_id, clip_id)
             except ValueError:
                 pass
-        
 
-        
         logger.info(f"Adding {num_sections} MIDI clips for '{song.title}' to ArrangerAutomation (starting at ID {max_id + 1})")
-        logger.info(f"  Song starts at beat {beat_position}, arrangement sections start at beat {beat_position + template_intro_duration}")
-        logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration} available beats")
-        
-        for section_idx, section_name in enumerate(sequence):
-            # Start arrangement sections after the template intro (which ends at beat 20)
-            section_beat_position = beat_position + template_intro_duration + (section_idx * beats_per_section)
-            section_duration = beats_per_section
-            
+
+        for section_idx, section_timing in enumerate(section_timings):
             # Create the MidiClip element directly in Events
             clip_id = max_id + section_idx + 1
             midi_clip = self._create_midi_clip_element(
-                name=section_name, 
-                beat_position=int(section_beat_position),  # Convert to int for XML
-                duration=section_duration,
+                name=section_timing['name'],
+                beat_position=section_timing['start'],
+                duration=section_timing['duration'],
                 clip_id=clip_id
             )
             events.append(midi_clip)
-            
-            logger.debug(f"  Added MIDI clip: {section_name} at beat {section_beat_position:.1f} (ID {clip_id})")
+
+            logger.debug(
+                f"  Added MIDI clip: {section_timing['name']} at beat {section_timing['start']:.2f} "
+                f"for {section_timing['duration']:.2f} beats (ID {clip_id})"
+            )
 
     def _get_clip_color(self, section_name: str) -> int:
         """Get color code for a clip based on section type.
@@ -2292,11 +3310,10 @@ class AbletonService:
         clip = copy.deepcopy(self.template_midi_clip)
         
         # Update the key attributes
-        beat_position_int = int(beat_position)
-        duration_int = int(duration)
+        clip_end = beat_position + duration
         
         clip.set('Id', str(clip_id))
-        clip.set('Time', str(beat_position_int))
+        clip.set('Time', self._format_beat_value(beat_position))
         
         # Update the name
         name_elem = clip.find('Name')
@@ -2313,16 +3330,16 @@ class AbletonService:
         # When you copy/paste a clip in Ableton, CurrentStart always equals Time
         current_start = clip.find('CurrentStart')
         if current_start is not None:
-            current_start.set('Value', str(beat_position_int))
+            current_start.set('Value', self._format_beat_value(beat_position))
         
         # Update CurrentEnd = Time + duration (the clip's actual duration on timeline)
         current_end = clip.find('CurrentEnd')
         if current_end is not None:
-            current_end.set('Value', str(beat_position_int + duration_int))
+            current_end.set('Value', self._format_beat_value(clip_end))
         
         # Log what we're setting for this clip
-        logger.debug(f"Creating clip '{name}': beat_position={beat_position_int}, duration={duration_int}")
-        logger.debug(f"  Set CurrentStart={beat_position_int}, CurrentEnd={beat_position_int + duration_int}")
+        logger.debug(f"Creating clip '{name}': beat_position={beat_position:.2f}, duration={duration:.2f}")
+        logger.debug(f"  Set CurrentStart={beat_position:.2f}, CurrentEnd={clip_end:.2f}")
         
         # Update Loop fields (these appear to have longer durations, likely from template)
         # Keep these as relative loop boundaries, not absolute timeline positions
@@ -2331,14 +3348,14 @@ class AbletonService:
             if elem.tag == 'Loop':
                 for child in elem:
                     if child.tag == 'HiddenLoopEnd':
-                        child.set('Value', str(duration_int))
-                        logger.debug(f"  Set HiddenLoopEnd={duration_int}")
+                        child.set('Value', self._format_beat_value(duration))
+                        logger.debug(f"  Set HiddenLoopEnd={duration:.2f}")
             
             # For TimeSelection/EndTime
             if elem.tag == 'TimeSelection':
                 for child in elem:
                     if child.tag == 'EndTime':
-                        child.set('Value', str(duration_int))
+                        child.set('Value', self._format_beat_value(duration))
         
         return clip
 

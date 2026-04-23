@@ -29,6 +29,7 @@ dependencies = [
     "python-levenshtein>=0.20.0",
     "lxml>=4.9.0",
     "xmltodict>=0.13.0",
+    "faster-whisper>=1.1.0",
     "loguru>=0.6.0",
     "click>=8.1.0",
     "pathlib2>=2.3.0",
