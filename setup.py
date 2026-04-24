@@ -12,11 +12,15 @@ def main():
     print("=" * 50)
 
     # Check Python version
-    if sys.version_info < (3, 8):
-        print("❌ Python 3.8 or higher is required")
+    if sys.version_info < (3, 10):
+        print("❌ Python 3.10 or higher is required")
         sys.exit(1)
 
     print(f"✅ Python {sys.version.split()[0]} detected")
+    if sys.version_info[:2] == (3, 14):
+        print("✅ Python 3.14 is supported")
+    elif sys.version_info[:2] < (3, 14):
+        print("ℹ️ Python 3.14 is the current recommended target for new local environments")
 
     # Create config directory if it doesn't exist
     config_dir = Path("config")
@@ -49,6 +53,7 @@ def main():
     # Check if dependencies are installed
     print("\n📦 Checking dependencies...")
     try:
+        import tkinter
         import customtkinter
         import PIL
         import requests
@@ -59,7 +64,7 @@ def main():
         print(f"Error: {e}")
 
     print("\n🎉 Setup complete!")
-    print("Run Rider with 'python -m projectfeb'.")
+    print("Run Rider with 'python run.py' or 'python -m projectfeb'.")
 
 def get_default_config() -> Dict[str, Any]:
     """Get default configuration."""

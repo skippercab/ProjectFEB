@@ -15,7 +15,9 @@ Rider: The Final Editing Bridge is a desktop app that turns Planning Center serv
 
 ## Requirements
 
-- Python 3.12 recommended
+- Python 3.10 or newer
+- Python 3.14 recommended for new installs
+- A Python build with Tk support (`python -c "import tkinter"` must succeed)
 - A Planning Center account with API credentials
 - A local Multitracks stems folder
 - An Ableton Live template `.als` file
@@ -25,13 +27,14 @@ Rider: The Final Editing Bridge is a desktop app that turns Planning Center serv
 ```bash
 git clone <repository-url>
 cd ProjectFEB
-python -m venv venv
-source venv/bin/activate
+python3.14 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+python -c "import tkinter"
 python setup.py
 ```
 
-You can also run the app with an existing compatible virtual environment if you already have one configured.
+You can also run the app with any existing Python 3.10+ virtual environment, as long as that interpreter has Tk support.
 
 ## Configuration
 
@@ -78,6 +81,8 @@ python run.py
 ```bash
 python -m projectfeb
 ```
+
+If `python run.py` fails with `_tkinter`, your interpreter was built without Tk support. Switch to a Tk-enabled Python and recreate the virtual environment before launching Rider.
 
 ## Output
 
@@ -147,6 +152,13 @@ python setup.py build
 **Generated set looks stale**
 
 - Check the configured output folder for the newest `Regen` export.
+
+**`ModuleNotFoundError: No module named '_tkinter'`**
+
+- Rider is a desktop Tk app, so the Python interpreter itself must include Tk support.
+- Verify the active interpreter with `python -c "import sys; print(sys.executable)"`.
+- Verify Tk support with `python -c "import tkinter"`.
+- If that import fails, install or use a Tk-enabled Python 3.10+ build, recreate your virtual environment, and reinstall requirements.
 
 ## Project Layout
 

@@ -13,6 +13,7 @@ import time
 import json
 import threading
 import queue
+import gc
 from dataclasses import asdict
 from PIL import Image, ImageTk
 
@@ -684,10 +685,18 @@ class ProjectFEBApp:
         self._set_busy(True, message)
 
         def task() -> None:
+            gc_was_enabled = gc.isenabled()
+            if gc_was_enabled:
+                # Tk objects must be finalized on the main thread on macOS.
+                gc.disable()
+
             try:
                 result = worker()
             except Exception as exc:
                 def handle_error(error: Exception = exc) -> None:
+                    if gc_was_enabled:
+                        gc.enable()
+                        gc.collect()
                     self._set_busy(False)
                     if on_error is not None:
                         on_error(error)
@@ -699,6 +708,9 @@ class ProjectFEBApp:
                 return
 
             def handle_success() -> None:
+                if gc_was_enabled:
+                    gc.enable()
+                    gc.collect()
                 self._set_busy(False)
                 if on_success is not None:
                     on_success(result)

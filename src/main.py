@@ -10,7 +10,6 @@ from pathlib import Path
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from projectfeb.ui.main_window import ProjectFEBApp
 from projectfeb.core.config import Config
 from projectfeb.utils.logging import setup_logging
 
@@ -76,6 +75,18 @@ def _configure_macos_app_identity(app_name: str = "Rider") -> None:
 def main():
     """Main application entry point."""
     _configure_macos_app_identity()
+
+    try:
+        from projectfeb.ui.main_window import ProjectFEBApp
+    except ModuleNotFoundError as exc:
+        if exc.name == "_tkinter":
+            raise SystemExit(
+                "Rider requires a Python build with Tk support. "
+                "The current interpreter is missing _tkinter. "
+                "On macOS, create a venv from a Tk-enabled Python 3.10+ interpreter "
+                "and verify it with `python -c \"import tkinter\"` before launching Rider."
+            ) from exc
+        raise
 
     # Set up logging
     setup_logging()
