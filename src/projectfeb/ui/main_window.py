@@ -3,17 +3,19 @@
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Callable, Any
 from loguru import logger
 import time
 import json
+import threading
+import queue
 from dataclasses import asdict
 
 from ..core.config import Config, default_output_buses
 from ..services.pco_service import (
     PlanningCenterService, PCOServicePlan, PCOFolder, PCOServiceType
 )
-from ..services.multitracks_service import MultitracksService, StemMatch
+from ..services.multitracks_service import MultitracksService, StemMatch, AudioStem
 from ..services.ableton_service import AbletonService
 
 class ProjectFEBApp:
@@ -31,6 +33,7 @@ class ProjectFEBApp:
         self.pco_service = PlanningCenterService(config.planning_center)
         self.multitracks_service = MultitracksService(config.multitracks)
         self.ableton_service = AbletonService(config.ableton)
+        self.ableton_service.ui_thread_dispatcher = self._call_on_ui_thread_and_wait
 
         # Current data
         self.folders: list[PCOFolder] = []
@@ -40,10 +43,17 @@ class ProjectFEBApp:
         self.selected_service_type: Optional[PCOServiceType] = None
         self.selected_plan: Optional[PCOServicePlan] = None
         self.stem_matches: Dict[str, StemMatch] = {}
+        self.is_busy = False
+        self.is_shutting_down = False
+        self.loading_status_base = ""
+        self.loading_status_pulse_on = False
+        self.suppress_selection_callbacks = False
+        self.pending_ui_callbacks: queue.Queue[Callable[[], None]] = queue.Queue()
 
         # Preferences file
         self.preferences_path = Path(__file__).parent.parent.parent.parent / "config" / "preferences.json"
         self.preferences = self._load_preferences()
+        self.multitracks_service.set_stem_type_overrides(self._stem_type_override_preferences())
 
         # Setup GUI
         ctk.set_appearance_mode("system")
@@ -52,26 +62,29 @@ class ProjectFEBApp:
         self.root = ctk.CTk()
         self.root.title("Project FEB - Planning Center to Ableton")
         self.root.geometry("1000x700")
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
         self._create_widgets()
+        self.root.after(50, self._process_pending_ui_callbacks)
+        self.root.after(4000, self._refresh_loading_status_heartbeat)
         self._load_initial_data()
 
     def _create_widgets(self):
         """Create the main GUI widgets."""
         # Main container
-        main_frame = ctk.CTkFrame(self.root)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        self.main_frame = ctk.CTkFrame(self.root)
+        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         # Title
         title_label = ctk.CTkLabel(
-            main_frame,
+            self.main_frame,
             text="Project FEB",
             font=ctk.CTkFont(size=24, weight="bold")
         )
         title_label.pack(pady=(20, 10))
 
         # Selection section (Folder -> Service Type -> Plan)
-        selection_frame = ctk.CTkFrame(main_frame)
+        selection_frame = ctk.CTkFrame(self.main_frame)
         selection_frame.pack(fill="x", padx=20, pady=(0, 10))
 
         # Folder selection
@@ -130,16 +143,16 @@ class ProjectFEBApp:
         self.service_combo.set("Select a service type first")
 
         # Refresh button
-        refresh_btn = ctk.CTkButton(
+        self.refresh_btn = ctk.CTkButton(
             selection_frame,
             text="Refresh",
             command=self._load_folders,
             width=100
         )
-        refresh_btn.pack(pady=(10, 0))
+        self.refresh_btn.pack(pady=(10, 0))
 
         # Stem matching section
-        stems_frame = ctk.CTkFrame(main_frame)
+        stems_frame = ctk.CTkFrame(self.main_frame)
         stems_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         stems_label = ctk.CTkLabel(
@@ -154,32 +167,200 @@ class ProjectFEBApp:
         self.results_text.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         # Action buttons
-        buttons_frame = ctk.CTkFrame(main_frame)
+        buttons_frame = ctk.CTkFrame(self.main_frame)
         buttons_frame.pack(fill="x", padx=20, pady=(0, 20))
 
         # Left side buttons
         left_buttons = ctk.CTkFrame(buttons_frame, fg_color="transparent")
         left_buttons.pack(side="left")
 
-        settings_btn = ctk.CTkButton(
+        self.settings_btn = ctk.CTkButton(
             left_buttons,
             text="Settings",
             command=self._open_settings
         )
-        settings_btn.pack(side="left", padx=(0, 10))
+        self.settings_btn.pack(side="left", padx=(0, 10))
 
         # Right side buttons
         right_buttons = ctk.CTkFrame(buttons_frame, fg_color="transparent")
         right_buttons.pack(side="right")
 
-        generate_btn = ctk.CTkButton(
+        self.generate_btn = ctk.CTkButton(
             right_buttons,
             text="Generate Setlist",
             command=self._generate_setlist,
             fg_color="green",
-            hover_color="dark green"
+            hover_color="dark green",
+            state="disabled"
         )
-        generate_btn.pack(side="right")
+        self.generate_btn.pack(side="right")
+
+        self.resolve_unknown_btn = ctk.CTkButton(
+            right_buttons,
+            text="Resolve Unknown Stems",
+            command=lambda: self._resolve_unknown_stems(show_success_if_none=True)
+        )
+        self.resolve_unknown_btn.pack(side="right", padx=(0, 10))
+
+        self.loading_overlay = ctk.CTkFrame(self.main_frame, corner_radius=16)
+        self.loading_status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            self.loading_overlay,
+            text="Working...",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(padx=24, pady=(20, 8))
+        ctk.CTkLabel(
+            self.loading_overlay,
+            textvariable=self.loading_status_var,
+            wraplength=320,
+            justify="center",
+        ).pack(padx=24, pady=(0, 12))
+        self.loading_progress = ctk.CTkProgressBar(self.loading_overlay, mode="indeterminate", width=240)
+        self.loading_progress.pack(padx=24, pady=(0, 20))
+        self.loading_overlay.place_forget()
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        """Toggle loading UI and disable controls while background work runs."""
+        self.is_busy = busy
+        logger.debug(f"Busy state -> {busy} ({message or 'idle'})")
+
+        combo_state = "disabled" if busy else "readonly"
+        button_state = "disabled" if busy else "normal"
+
+        self.folder_combo.configure(state=combo_state)
+        self.service_type_combo.configure(state=combo_state)
+        self.service_combo.configure(state=combo_state)
+        self.refresh_btn.configure(state=button_state)
+        self.settings_btn.configure(state=button_state)
+        self.resolve_unknown_btn.configure(state=button_state)
+
+        if busy:
+            self.generate_btn.configure(state="disabled")
+            self._set_loading_status(message or "Working...")
+            self.loading_overlay.place(relx=0.5, rely=0.5, anchor="center")
+            self.loading_overlay.lift()
+            self.loading_progress.start()
+        else:
+            self.loading_status_base = ""
+            self.loading_status_pulse_on = False
+            self.loading_status_var.set("")
+            self.loading_progress.stop()
+            self.loading_overlay.place_forget()
+            self._update_action_button_states()
+
+    def _set_combo_value(self, combo: ctk.CTkComboBox, value: str) -> None:
+        """Set a combo value without firing the selection handler twice."""
+        self.suppress_selection_callbacks = True
+        try:
+            combo.set(value)
+        finally:
+            self.suppress_selection_callbacks = False
+
+    def _process_pending_ui_callbacks(self) -> None:
+        """Run worker-thread results safely on the Tk main thread."""
+        try:
+            while True:
+                callback = self.pending_ui_callbacks.get_nowait()
+                callback()
+        except queue.Empty:
+            pass
+
+        if self.root.winfo_exists():
+            self.root.after(50, self._process_pending_ui_callbacks)
+
+    def _call_on_ui_thread_and_wait(self, callback: Callable[[], Any]) -> Any:
+        """Execute a callback on the Tk thread and block the worker until it completes."""
+        if threading.current_thread() is threading.main_thread():
+            return callback()
+
+        done = threading.Event()
+        result: Dict[str, Any] = {}
+
+        def run_callback() -> None:
+            try:
+                result['value'] = callback()
+            except Exception as exc:
+                result['error'] = exc
+            finally:
+                done.set()
+
+        self.pending_ui_callbacks.put(run_callback)
+        done.wait()
+
+        if 'error' in result:
+            raise result['error']
+        return result.get('value')
+
+    def _set_loading_status(self, message: str) -> None:
+        """Update the loading overlay text while background work is in progress."""
+        self.loading_status_base = message
+        self.loading_status_pulse_on = False
+        self.loading_status_var.set(message)
+
+    def _refresh_loading_status_heartbeat(self) -> None:
+        """Refresh loading text periodically so long-running steps still look active."""
+        if self.is_busy and self.loading_status_base:
+            self.loading_status_pulse_on = not self.loading_status_pulse_on
+            status_text = self.loading_status_base
+            if self.loading_status_pulse_on:
+                status_text = f"{status_text}\nStill working..."
+            self.loading_status_var.set(status_text)
+
+        if self.root.winfo_exists():
+            self.root.after(4000, self._refresh_loading_status_heartbeat)
+
+    def _run_background_task(
+        self,
+        message: str,
+        worker: Callable[[], Any],
+        on_success: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
+        """Run blocking work in a background thread and marshal results to the UI thread."""
+        if self.is_busy:
+            logger.debug(f"Skipping background task while already busy: {message}")
+            return
+
+        self._set_busy(True, message)
+
+        def task() -> None:
+            try:
+                result = worker()
+            except Exception as exc:
+                def handle_error(error: Exception = exc) -> None:
+                    self._set_busy(False)
+                    if on_error is not None:
+                        on_error(error)
+                    else:
+                        logger.error(f"Background task failed: {error}")
+                        messagebox.showerror("Error", str(error))
+
+                self.pending_ui_callbacks.put(handle_error)
+                return
+
+            def handle_success() -> None:
+                self._set_busy(False)
+                if on_success is not None:
+                    on_success(result)
+
+            self.pending_ui_callbacks.put(handle_success)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _update_action_button_states(self):
+        """Enable generation only when the current plan has no unresolved stems."""
+        can_generate = bool(
+            not self.is_busy and self.selected_plan and self.stem_matches and not self._get_unknown_stems()
+        )
+        self.generate_btn.configure(state="normal" if can_generate else "disabled")
+
+    def _clear_matching_state(self, message: Optional[str] = None):
+        """Reset current match results and refresh action button state."""
+        self.stem_matches = {}
+        self.results_text.delete("0.0", "end")
+        if message:
+            self.results_text.insert("0.0", message)
+        self._update_action_button_states()
 
     def _load_initial_data(self):
         """Load initial data when the app starts."""
@@ -205,13 +386,22 @@ class ProjectFEBApp:
         except Exception as e:
             logger.error(f"Failed to save preferences: {e}")
 
+    def _stem_type_override_preferences(self) -> Dict[str, str]:
+        """Return persisted stem-type override mappings from preferences."""
+        overrides = self.preferences.get('stem_type_overrides', {})
+        return overrides if isinstance(overrides, dict) else {}
+
     def _load_folders(self):
         """Load folders from Planning Center Online."""
-        try:
+        def worker() -> List[PCOFolder]:
             logger.info("=== STARTING _load_folders ===")
-            self.folders = self.pco_service.get_folders()
-            logger.info(f"Step 1: Service returned {len(self.folders) if self.folders else 0} folders")
-            logger.debug(f"Folder IDs from service: {[f.id for f in self.folders] if self.folders else []}")
+            folders = self.pco_service.get_folders()
+            logger.info(f"Step 1: Service returned {len(folders) if folders else 0} folders")
+            logger.debug(f"Folder IDs from service: {[f.id for f in folders] if folders else []}")
+            return folders
+
+        def on_success(folders: List[PCOFolder]) -> None:
+            self.folders = folders
 
             if not self.folders:
                 logger.error("No folders returned from PCO service!")
@@ -265,18 +455,28 @@ class ProjectFEBApp:
                         break
             
             if default_folder_name:
-                self.folder_combo.set(default_folder_name)
+                self._set_combo_value(self.folder_combo, default_folder_name)
                 logger.info(f"Step 6: Set default selection to: {default_folder_name}")
                 self._on_folder_selected(default_folder_name)
             
             logger.info("=== COMPLETED _load_folders ===")
 
-        except Exception as e:
+        def on_error(e: Exception) -> None:
             logger.error(f"Failed to load folders: {e}", exc_info=True)
             messagebox.showerror("Error", f"Failed to load folders:\n{str(e)}")
 
+        self._run_background_task("Loading Planning Center folders...", worker, on_success, on_error)
+
     def _on_folder_selected(self, selection: str):
         """Handle folder selection."""
+        if self.suppress_selection_callbacks:
+            return
+
+        self.selected_service_type = None
+        self.selected_plan = None
+        self.service_plans = []
+        self._clear_matching_state()
+
         if selection == "No folders found" or not selection:
             self.service_type_combo.configure(values=[])
             self.service_combo.configure(values=[])
@@ -304,14 +504,16 @@ class ProjectFEBApp:
         if not self.selected_folder:
             return
 
-        try:
-            self.service_types = self.pco_service.get_service_types_for_folder(
-                self.selected_folder.id
-            )
+        selected_folder = self.selected_folder
 
+        def worker() -> List[PCOServiceType]:
+            return self.pco_service.get_service_types_for_folder(selected_folder.id)
+
+        def on_success(service_types: List[PCOServiceType]) -> None:
+            self.service_types = service_types
             if not self.service_types:
                 self.service_type_combo.configure(values=["No service types found"])
-                self.service_type_combo.set("No service types found")
+                self._set_combo_value(self.service_type_combo, "No service types found")
                 self.service_combo.configure(values=[])
                 return
 
@@ -335,15 +537,29 @@ class ProjectFEBApp:
                         break
             
             if default_service_type:
-                self.service_type_combo.set(default_service_type)
+                self._set_combo_value(self.service_type_combo, default_service_type)
                 self._on_service_type_selected(default_service_type)
 
-        except Exception as e:
+        def on_error(e: Exception) -> None:
             logger.error(f"Failed to load service types: {e}")
             messagebox.showerror("Error", f"Failed to load service types:\n{str(e)}")
 
+        self._run_background_task(
+            f"Loading service types for {selected_folder.name}...",
+            worker,
+            on_success,
+            on_error,
+        )
+
     def _on_service_type_selected(self, selection: str):
         """Handle service type selection."""
+        if self.suppress_selection_callbacks:
+            return
+
+        self.selected_plan = None
+        self.service_plans = []
+        self._clear_matching_state()
+
         if selection == "No service types found" or not selection:
             self.service_combo.configure(values=[])
             return
@@ -369,21 +585,25 @@ class ProjectFEBApp:
         if not self.selected_service_type:
             return
 
-        try:
+        selected_service_type = self.selected_service_type
+
+        def worker() -> List[PCOServicePlan]:
             start_time = time.time()
-            logger.info(f"Starting to load plans for service type: {self.selected_service_type.name}")
+            logger.info(f"Starting to load plans for service type: {selected_service_type.name}")
             
             api_start = time.time()
-            self.service_plans = self.pco_service.get_plans_for_service_type(
-                self.selected_service_type.id
-            )
+            service_plans = self.pco_service.get_plans_for_service_type(selected_service_type.id)
             api_time = time.time() - api_start
-            logger.info(f"API call took {api_time:.2f} seconds to fetch {len(self.service_plans) if self.service_plans else 0} plans")
+            logger.info(f"API call took {api_time:.2f} seconds to fetch {len(service_plans) if service_plans else 0} plans")
+            logger.info(f"Total _load_service_plans_for_service_type took {time.time() - start_time:.2f} seconds")
+            return service_plans
 
+        def on_success(service_plans: List[PCOServicePlan]) -> None:
+            self.service_plans = service_plans
             if not self.service_plans:
                 self.service_combo.configure(values=["No plans found"])
-                self.service_combo.set("No plans found")
-                self.results_text.delete("0.0", "end")
+                self._set_combo_value(self.service_combo, "No plans found")
+                self._clear_matching_state()
                 return
 
             # Format plan names for display
@@ -400,20 +620,29 @@ class ProjectFEBApp:
             self.service_combo.configure(values=plan_names)
             # Don't automatically select the first plan - let the user choose
             # This prevents expensive stem matching until a plan is actually selected
-            self.results_text.delete("0.0", "end")
-            self.results_text.insert("0.0", "Select a service plan from the dropdown above to begin matching stems.")
+            self._clear_matching_state("Select a service plan from the dropdown above to begin matching stems.")
             ui_time = time.time() - ui_start
             logger.info(f"UI update took {ui_time:.2f} seconds")
-            
-            total_time = time.time() - start_time
-            logger.info(f"Total _load_service_plans_for_service_type took {total_time:.2f} seconds")
 
-        except Exception as e:
+        def on_error(e: Exception) -> None:
             logger.error(f"Failed to load service plans: {e}")
             messagebox.showerror("Error", f"Failed to load service plans:\n{str(e)}")
 
+        self._run_background_task(
+            f"Loading plans for {selected_service_type.name}...",
+            worker,
+            on_success,
+            on_error,
+        )
+
     def _on_service_selected(self, selection: str):
         """Handle service plan selection."""
+        if self.suppress_selection_callbacks:
+            return
+
+        self.selected_plan = None
+        self._clear_matching_state()
+
         if selection == "No plans found":
             return
 
@@ -435,36 +664,60 @@ class ProjectFEBApp:
         """Fetch songs for the selected plan (deferred until plan is selected)."""
         if not self.selected_plan or not self.selected_service_type:
             return
-        
-        try:
+
+        selected_plan = self.selected_plan
+        selected_service_type = self.selected_service_type
+
+        def worker() -> Dict[str, StemMatch]:
             fetch_start = time.time()
-            logger.info(f"Starting to fetch songs for plan: {self.selected_plan.title}")
-            
-            self.pco_service._populate_plan_songs(self.selected_plan, self.selected_service_type.id)
-            
+            logger.info(f"Starting to fetch songs for plan: {selected_plan.title}")
+            self.pco_service._populate_plan_songs(selected_plan, selected_service_type.id)
             fetch_time = time.time() - fetch_start
-            logger.info(f"Fetching plan songs took {fetch_time:.2f} seconds for {len(self.selected_plan.songs)} songs")
-            
-            self._match_stems_for_plan()
-        except Exception as e:
+            logger.info(f"Fetching plan songs took {fetch_time:.2f} seconds for {len(selected_plan.songs)} songs")
+            song_titles = [song.title for song in selected_plan.songs]
+            return self.multitracks_service.find_stems_for_songs(song_titles)
+
+        def on_success(matches: Dict[str, StemMatch]) -> None:
+            self.stem_matches = matches
+            self._display_matching_results()
+
+        def on_error(e: Exception) -> None:
             logger.error(f"Failed to fetch plan songs: {e}")
             messagebox.showerror("Error", f"Failed to fetch plan songs:\n{str(e)}")
+
+        self._run_background_task(
+            f"Loading songs and matching stems for {selected_plan.title}...",
+            worker,
+            on_success,
+            on_error,
+        )
 
     def _match_stems_for_plan(self):
         """Match stems for the selected service plan."""
         if not self.selected_plan:
             return
 
-        try:
-            song_titles = [song.title for song in self.selected_plan.songs]
-            self.stem_matches = self.multitracks_service.find_stems_for_songs(song_titles)
+        selected_plan = self.selected_plan
 
-            # Display results
+        def worker() -> Dict[str, StemMatch]:
+            song_titles = [song.title for song in selected_plan.songs]
+            return self.multitracks_service.find_stems_for_songs(song_titles)
+
+        def on_success(matches: Dict[str, StemMatch]) -> None:
+            self.stem_matches = matches
             self._display_matching_results()
 
-        except Exception as e:
+        def on_error(e: Exception) -> None:
+            self._clear_matching_state()
             logger.error(f"Failed to match stems: {e}")
             messagebox.showerror("Error", f"Failed to match stems:\n{str(e)}")
+
+        self._run_background_task(
+            f"Matching stems for {selected_plan.title}...",
+            worker,
+            on_success,
+            on_error,
+        )
 
     def _display_matching_results(self):
         """Display the stem matching results in the text area."""
@@ -480,9 +733,12 @@ class ProjectFEBApp:
 
         total_songs = len(self.selected_plan.songs)
         matched_songs = len(self.stem_matches)
+        unknown_stems = self._get_unknown_stems()
 
         results.append(f"Songs in plan: {total_songs}")
         results.append(f"Songs with stems found: {matched_songs}")
+        if unknown_stems:
+            results.append(f"Unknown stems needing review: {len(unknown_stems)}")
         results.append("")
 
         for song in self.selected_plan.songs:
@@ -493,7 +749,8 @@ class ProjectFEBApp:
                 results.append(f"   ✓ Found {len(match.stems)} stems (confidence: {confidence_pct}%)")
 
                 for stem in match.stems:
-                    results.append(f"     • {stem.stem_type.title()}: {stem.filename}")
+                    stem_prefix = "⚠ Unknown" if stem.stem_type == 'unknown' else stem.stem_type.title()
+                    results.append(f"     • {stem_prefix}: {stem.filename}")
 
                 if match.missing_stems:
                     results.append(f"     ⚠ Missing: {', '.join(match.missing_stems)}")
@@ -502,6 +759,44 @@ class ProjectFEBApp:
             results.append("")
 
         self.results_text.insert("0.0", "\n".join(results))
+        self._update_action_button_states()
+
+    def _get_unknown_stems(self) -> List[tuple[str, AudioStem]]:
+        """Return unresolved unknown stems for the current plan."""
+        unknown_stems: List[tuple[str, AudioStem]] = []
+        if not self.selected_plan:
+            return unknown_stems
+
+        for song in self.selected_plan.songs:
+            match = self.stem_matches.get(song.title)
+            if not match:
+                continue
+            for stem in match.stems:
+                if stem.stem_type == 'unknown':
+                    unknown_stems.append((song.title, stem))
+
+        return unknown_stems
+
+    def _resolve_unknown_stems(self, show_success_if_none: bool = False) -> bool:
+        """Resolve unknown stems into remembered groups before generation."""
+        unknown_stems = self._get_unknown_stems()
+        if not unknown_stems:
+            if show_success_if_none:
+                messagebox.showinfo("Unknown Stems", "No unknown stems need review right now.")
+            return True
+
+        dialog = UnknownStemResolutionDialog(self.root, self.multitracks_service, unknown_stems)
+        self.root.wait_window(dialog.dialog)
+        if dialog.result is None:
+            return False
+
+        overrides = self._stem_type_override_preferences()
+        overrides.update(dialog.result)
+        self.preferences['stem_type_overrides'] = overrides
+        self._save_preferences()
+        self.multitracks_service.set_stem_type_overrides(overrides)
+        self._match_stems_for_plan()
+        return True
 
     def _generate_setlist(self):
         """Generate the Ableton Live setlist."""
@@ -509,18 +804,27 @@ class ProjectFEBApp:
             messagebox.showwarning("Warning", "Please select a service plan with matched stems first.")
             return
 
-        try:
-            # Get service type name and plan date for proper naming
-            service_type_name = self.selected_service_type.name if self.selected_service_type else "Service"
-            service_date = self.selected_plan.date
-            
-            output_path = self.ableton_service.generate_setlist(
+        if self._get_unknown_stems():
+            self._update_action_button_states()
+            messagebox.showwarning("Resolve Unknown Stems", "Resolve all unknown stems before generating the setlist.")
+            return
+
+        service_type_name = self.selected_service_type.name if self.selected_service_type else "Service"
+        service_date = self.selected_plan.date
+        stem_matches = self.stem_matches
+        plan_songs = self.selected_plan.songs
+
+        def worker() -> Optional[Path]:
+            self.ableton_service.status_reporter = self._set_loading_status
+            return self.ableton_service.generate_setlist(
                 service_type_name=service_type_name,
                 service_date=service_date,
-                stem_matches=self.stem_matches,
-                plan_songs=self.selected_plan.songs
+                stem_matches=stem_matches,
+                plan_songs=plan_songs,
             )
 
+        def on_success(output_path: Optional[Path]) -> None:
+            self.ableton_service.status_reporter = None
             if output_path:
                 messagebox.showinfo(
                     "Success",
@@ -529,9 +833,17 @@ class ProjectFEBApp:
             else:
                 messagebox.showerror("Error", "Failed to generate setlist.")
 
-        except Exception as e:
+        def on_error(e: Exception) -> None:
+            self.ableton_service.status_reporter = None
             logger.error(f"Failed to generate setlist: {e}")
             messagebox.showerror("Error", f"Failed to generate setlist:\n{str(e)}")
+
+        self._run_background_task(
+            f"Generating Ableton setlist for {service_date.strftime('%Y-%m-%d')}...",
+            worker,
+            on_success,
+            on_error,
+        )
 
     def _open_settings(self):
         """Open the settings dialog."""
@@ -546,6 +858,8 @@ class ProjectFEBApp:
         self.pco_service = PlanningCenterService(self.config.planning_center)
         self.multitracks_service = MultitracksService(self.config.multitracks)
         self.ableton_service = AbletonService(self.config.ableton)
+        self.ableton_service.ui_thread_dispatcher = self._call_on_ui_thread_and_wait
+        self.multitracks_service.set_stem_type_overrides(self._stem_type_override_preferences())
         
         # Reload folders after settings are potentially changed
         self._load_folders()
@@ -553,6 +867,23 @@ class ProjectFEBApp:
     def run(self):
         """Run the application main loop."""
         self.root.mainloop()
+
+    def shutdown(self):
+        """Best-effort application shutdown for GUI close or terminal interrupt."""
+        if self.is_shutting_down:
+            return
+
+        self.is_shutting_down = True
+
+        try:
+            self.ableton_service.shutdown()
+        except Exception as exc:
+            logger.debug(f"Ableton service shutdown raised: {exc}")
+
+        try:
+            self.root.destroy()
+        except Exception as exc:
+            logger.debug(f"Tk shutdown raised: {exc}")
 
 
 class SettingsDialog:
@@ -1108,7 +1439,6 @@ class SettingsDialog:
                 "Error",
                 f"Failed to save settings:\n{str(e)}"
             )
-
     def _parse_output_buses(self) -> list[dict]:
         """Collect and validate the structured output bus editor state."""
         output_buses = []
@@ -1179,3 +1509,134 @@ class SettingsDialog:
                 "Connection Failed",
                 f"Failed to connect to Planning Center Online:\n{str(e)}"
             )
+
+
+class UnknownStemResolutionDialog:
+    """Modal dialog for resolving unknown stems into remembered stem groups."""
+
+    STEM_TYPE_OPTIONS = [
+        ('perc', 'Perc'),
+        ('bass', 'Bass'),
+        ('leads', 'Lead'),
+        ('strings', 'Strings'),
+        ('keys', 'Keys'),
+        ('vocals', 'Vocals'),
+        ('guide', 'Guide'),
+    ]
+
+    def __init__(self, parent, multitracks_service: MultitracksService, unknown_stems: List[tuple[str, AudioStem]]):
+        self.multitracks_service = multitracks_service
+        self.result: Optional[Dict[str, str]] = None
+        self.rows: List[Dict[str, object]] = []
+
+        grouped_unknowns: Dict[str, Dict[str, object]] = {}
+        for song_title, stem in unknown_stems:
+            suggested_keyword = multitracks_service.suggest_override_keyword(stem)
+            normalized_keyword = multitracks_service._normalize_stem_override_keyword(suggested_keyword)
+            group_key = normalized_keyword or stem.filename.lower()
+            group = grouped_unknowns.setdefault(
+                group_key,
+                {
+                    'keyword': group_key,
+                    'examples': [],
+                },
+            )
+            examples = group['examples']
+            if len(examples) < 3:
+                examples.append(f"{song_title}: {stem.filename}")
+
+        self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.title("Resolve Unknown Stems")
+        self.dialog.geometry("920x640")
+        self.dialog.resizable(True, True)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        main_frame = ctk.CTkScrollableFrame(self.dialog)
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        title = ctk.CTkLabel(
+            main_frame,
+            text="Resolve Unknown Stem Types",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        title.pack(anchor="w", pady=(0, 8))
+
+        subtitle = ctk.CTkLabel(
+            main_frame,
+            text=(
+                "Assign each unknown instrument to a routing group. "
+                "The app will remember the filename pattern automatically for next time."
+            ),
+            justify="left",
+            wraplength=820,
+        )
+        subtitle.pack(anchor="w", pady=(0, 16))
+
+        combo_values = [label for _, label in self.STEM_TYPE_OPTIONS]
+        for group in grouped_unknowns.values():
+            row_frame = ctk.CTkFrame(main_frame)
+            row_frame.pack(fill="x", pady=(0, 10))
+
+            ctk.CTkLabel(
+                row_frame,
+                text="\n".join(group['examples']),
+                justify="left",
+                anchor="w",
+            ).pack(fill="x", padx=12, pady=(10, 6))
+
+            controls = ctk.CTkFrame(row_frame, fg_color="transparent")
+            controls.pack(fill="x", padx=12, pady=(0, 10))
+
+            ctk.CTkLabel(
+                controls,
+                text="Return group",
+                width=120,
+                anchor="w",
+            ).pack(side="left", padx=(0, 8))
+
+            combo = ctk.CTkComboBox(controls, values=combo_values, state="readonly", width=140)
+            combo.set('Strings')
+            combo.pack(side="left")
+
+            self.rows.append({
+                'keyword': group['keyword'],
+                'combo': combo,
+            })
+
+        button_row = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_row.pack(fill="x", pady=(12, 0))
+
+        ctk.CTkButton(
+            button_row,
+            text="Cancel",
+            command=self.dialog.destroy,
+        ).pack(side="right")
+        ctk.CTkButton(
+            button_row,
+            text="Save and Continue",
+            fg_color="green",
+            hover_color="dark green",
+            command=self._save,
+        ).pack(side="right", padx=(0, 8))
+
+    def _save(self) -> None:
+        resolved: Dict[str, str] = {}
+        label_to_type = {label: stem_type for stem_type, label in self.STEM_TYPE_OPTIONS}
+
+        for row in self.rows:
+            keyword = self.multitracks_service._normalize_stem_override_keyword(str(row['keyword']))
+            if not keyword:
+                messagebox.showwarning("Unknown Stems", "Could not determine a filename pattern for one of the unknown stems.")
+                return
+
+            selected_label = row['combo'].get()
+            selected_type = label_to_type.get(selected_label)
+            if not selected_type:
+                messagebox.showwarning("Unknown Stems", "Choose a group for each unknown stem.")
+                return
+
+            resolved[keyword] = selected_type
+
+        self.result = resolved
+        self.dialog.destroy()

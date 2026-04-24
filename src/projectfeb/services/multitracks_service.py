@@ -2,6 +2,8 @@
 
 import os
 import re
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -33,6 +35,9 @@ class StemMatch:
 
 class MultitracksService:
     """Service for discovering and matching Multitracks audio stems."""
+
+    FOLDER_TRAILING_MODIFIERS = {'sw'}
+    ESSENTIAL_STEM_TYPES = ['vocals', 'perc', 'bass', 'strings', 'keys']
 
     # Common stem types and their variations - organized by Ableton template groups
     STEM_TYPES = {
@@ -68,6 +73,8 @@ class MultitracksService:
         """
         self.config = config
         self.stems_folder = Path(config.stems_folder) if config.stems_folder else None
+        self.extracted_archive_dirs: List[Path] = []
+        self.stem_type_overrides: Dict[str, str] = {}
 
         # Build reverse mapping for stem type detection
         self.stem_keywords = {}
@@ -155,6 +162,19 @@ class MultitracksService:
                 song_stems = self._find_stems_in_song_folder(song_folder, clean_title, extensions)
                 stems.extend(song_stems)
 
+            # Process zip-only songs that do not already have an expanded folder
+            for zip_file in zip_files:
+                if zip_file.stem in folder_names:
+                    continue
+
+                extracted_song_folder = self._extract_zip_song_folder(zip_file)
+                if extracted_song_folder is None:
+                    continue
+
+                clean_title = self._extract_song_title_from_folder(extracted_song_folder.name)
+                song_stems = self._find_stems_in_song_folder(extracted_song_folder, clean_title, extensions)
+                stems.extend(song_stems)
+
             logger.info(f"Discovered {len(stems)} audio stem files across {len(folders_to_process)} song folders")
             if duplicates:
                 logger.warning(f"Skipped {len(duplicates)} .zip files that had matching folders")
@@ -187,6 +207,38 @@ class MultitracksService:
         # In the future, this method could be enhanced to prompt the user
         # via the UI (e.g., a dialog asking which to use)
         return folder
+
+    def _extract_zip_song_folder(self, zip_file: Path) -> Optional[Path]:
+        """Extract a zip-only song pack to a temp folder and return its song root."""
+        try:
+            extract_root = Path(tempfile.mkdtemp(prefix='projectfeb_stems_'))
+            self.extracted_archive_dirs.append(extract_root)
+
+            with zipfile.ZipFile(zip_file) as archive:
+                for member in archive.infolist():
+                    member_path = extract_root / member.filename
+                    resolved_path = member_path.resolve()
+                    if extract_root.resolve() not in resolved_path.parents and resolved_path != extract_root.resolve():
+                        logger.warning(f"Skipping unsafe zip member '{member.filename}' from {zip_file.name}")
+                        continue
+                    archive.extract(member, extract_root)
+
+            preferred_root = extract_root / zip_file.stem
+            if preferred_root.exists() and preferred_root.is_dir():
+                logger.info(f"Extracted zip-only song pack '{zip_file.name}' to {preferred_root}")
+                return preferred_root
+
+            child_dirs = [child for child in extract_root.iterdir() if child.is_dir() and child.name != '__MACOSX']
+            if len(child_dirs) == 1:
+                logger.info(f"Extracted zip-only song pack '{zip_file.name}' to {child_dirs[0]}")
+                return child_dirs[0]
+
+            logger.info(f"Extracted zip-only song pack '{zip_file.name}' to {extract_root}")
+            return extract_root
+
+        except Exception as exc:
+            logger.error(f"Failed to extract zip-only song pack '{zip_file}': {exc}")
+            return None
 
     def _parse_stem_file(self, file_path: Path) -> Optional[AudioStem]:
         """Parse a stem file to extract song title and stem type."""
@@ -259,6 +311,21 @@ class MultitracksService:
         Handles compound keywords like "Synth Bass" by prioritizing "Bass".
         """
         text_lower = text.lower()
+        normalized_text = self._normalize_stem_override_keyword(text_lower)
+        override_match = self._match_stem_type_override(text_lower)
+        if override_match:
+            return override_match
+
+        # Keyboard compound names should beat the generic "electric" guitar hint.
+        for keys_phrase in (
+            'electric piano',
+            'electric keys',
+            'electric organ',
+            'electric rhodes',
+            'electric wurlitzer',
+        ):
+            if keys_phrase in normalized_text:
+                return 'keys'
         
         # Special handling: if "bass" appears anywhere, check if it's in a compound keyword
         # Compounds like "synth bass", "electric bass" should map to bass category
@@ -308,6 +375,44 @@ class MultitracksService:
         # If no match found, return 'unknown' for manual review
         return best_match if best_match else 'unknown'
 
+    def set_stem_type_overrides(self, overrides: Dict[str, str]) -> None:
+        """Replace custom stem-type overrides with persisted user mappings."""
+        normalized_overrides: Dict[str, str] = {}
+        valid_types = set(self.STEM_TYPES.keys())
+        for keyword, stem_type in (overrides or {}).items():
+            normalized_keyword = self._normalize_stem_override_keyword(keyword)
+            normalized_type = str(stem_type).strip().lower()
+            if not normalized_keyword or normalized_type not in valid_types:
+                continue
+            normalized_overrides[normalized_keyword] = normalized_type
+
+        self.stem_type_overrides = normalized_overrides
+
+    def _normalize_stem_override_keyword(self, text: str) -> str:
+        """Normalize a user-provided instrument keyword for matching and persistence."""
+        normalized = re.sub(r'[^a-z0-9]+', ' ', (text or '').lower())
+        return re.sub(r'\s+', ' ', normalized).strip()
+
+    def _match_stem_type_override(self, text: str) -> Optional[str]:
+        """Return a custom override stem type when a remembered keyword is present."""
+        if not self.stem_type_overrides:
+            return None
+
+        normalized_text = self._normalize_stem_override_keyword(text)
+        if not normalized_text:
+            return None
+
+        padded_text = f" {normalized_text} "
+        best_match = None
+        best_length = -1
+        for keyword, stem_type in self.stem_type_overrides.items():
+            padded_keyword = f" {keyword} "
+            if padded_keyword in padded_text and len(keyword) > best_length:
+                best_match = stem_type
+                best_length = len(keyword)
+
+        return best_match
+
     def _extract_song_title(self, filename: str) -> str:
         """Extract song title from filename when no clear separator exists."""
         # Remove common prefixes/suffixes
@@ -331,6 +436,8 @@ class MultitracksService:
 
     def _find_stems_for_song(self, song_title: str, all_stems: List[AudioStem]) -> Optional[StemMatch]:
         """Find all stems for a specific song."""
+        requested_variants = self._song_title_match_variants(song_title)
+
         # Filter stems that might match this song
         candidate_stems = []
         for stem in all_stems:
@@ -338,9 +445,13 @@ class MultitracksService:
             if (stem.filename.lower().startswith('classic-') and stem.filename.lower().endswith('.aif')) or \
                stem.filename.lower().endswith('- click.wav') or stem.filename.lower() == 'click.wav':
                 continue
-                
-            # Use fuzzy matching on song titles
-            confidence = fuzz.ratio(song_title.lower(), stem.song_title.lower())
+
+            stem_variants = self._song_title_match_variants(stem.song_title)
+            confidence = max(
+                fuzz.ratio(requested_variant, stem_variant)
+                for requested_variant in requested_variants
+                for stem_variant in stem_variants
+            )
             if confidence >= 85:  # Minimum confidence threshold - increased to avoid false matches
                 stem.confidence = confidence / 100.0
                 candidate_stems.append(stem)
@@ -354,28 +465,64 @@ class MultitracksService:
 
         # Calculate overall match confidence
         avg_confidence = sum(stem.confidence for stem in matched_stems) / len(matched_stems)
-
-        # Check for missing common stems
         available_types = set(stem.stem_type for stem in matched_stems)
-        missing_types = []
-        essential_stems = ['vocals', 'perc', 'bass', 'strings', 'keys']  # Based on Ableton template groups
 
-        for stem_type in essential_stems:
-            if stem_type not in available_types:
-                missing_types.append(stem_type)
-
-        match = StemMatch(
-            song_title=song_title,
-            stems=matched_stems,
-            match_confidence=avg_confidence,
-            missing_stems=missing_types
-        )
+        match = self._build_stem_match(song_title, matched_stems, avg_confidence)
 
         logger.info(f"Found {len(matched_stems)} stems for '{song_title}' (confidence: {avg_confidence:.2f})")
         if 'unknown' in available_types:
             unknown_count = len([s for s in matched_stems if s.stem_type == 'unknown'])
             logger.warning(f"⚠️  {unknown_count} stems categorized as 'unknown' - may need manual review")
         return match
+
+    def _build_stem_match(self, song_title: str, matched_stems: List[AudioStem], avg_confidence: float) -> StemMatch:
+        """Build a StemMatch and recalculate missing groups from current stem types."""
+        available_types = set(stem.stem_type for stem in matched_stems)
+        missing_types = [
+            stem_type for stem_type in self.ESSENTIAL_STEM_TYPES
+            if stem_type not in available_types
+        ]
+        return StemMatch(
+            song_title=song_title,
+            stems=matched_stems,
+            match_confidence=avg_confidence,
+            missing_stems=missing_types,
+        )
+
+    def suggest_override_keyword(self, stem: AudioStem) -> str:
+        """Suggest a reusable keyword for a user stem-type override."""
+        stem_name = stem.path.stem
+        song_variants = self._song_title_match_variants(stem.song_title)
+
+        def matches_song_title(normalized_part: str) -> bool:
+            return any(
+                variant and (normalized_part == variant or variant in normalized_part or normalized_part in variant)
+                for variant in song_variants
+            )
+
+        for separator in [' - ', ' – ', ' — ', '_']:
+            if separator not in stem_name:
+                continue
+            parts = [part.strip() for part in stem_name.split(separator) if part.strip()]
+            for part in parts:
+                normalized_part = self._normalize_stem_override_keyword(part)
+                if not normalized_part:
+                    continue
+                if matches_song_title(normalized_part):
+                    continue
+                return part.strip()
+
+        cleaned_name = re.sub(r'\s*[\(\[\{][^\)\]\}]*[\)\]\}]', '', stem_name)
+        for variant in sorted(song_variants, key=len, reverse=True):
+            if not variant:
+                continue
+            pattern = re.compile(re.escape(variant), flags=re.IGNORECASE)
+            cleaned_name = pattern.sub(' ', cleaned_name)
+
+        cleaned_name = re.sub(r'\b\d+\b', ' ', cleaned_name)
+        cleaned_name = re.sub(r'[^A-Za-z0-9]+', ' ', cleaned_name)
+        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+        return cleaned_name or stem_name
 
     def get_available_stems_summary(self) -> Dict[str, int]:
         """Get a summary of available stems by type."""
@@ -416,8 +563,10 @@ class MultitracksService:
         # Remove key information in brackets [A-G][b#]?[anything]
         title = re.sub(r'\s*\[[A-G][b#]?[\w]*\]', '', title)
 
-        # Remove trailing modifiers (like "sw" for switch)
-        title = re.sub(r'\s+\w{1,3}$', '', title)
+        # Remove known trailing modifiers (like "sw" for switch) but keep short real title words like "Joy"
+        parts = title.split()
+        if parts and parts[-1].lower() in self.FOLDER_TRAILING_MODIFIERS:
+            title = ' '.join(parts[:-1])
 
         # Clean up extra spaces
         title = re.sub(r'\s+', ' ', title).strip()
@@ -426,6 +575,27 @@ class MultitracksService:
         title = title.replace('&', 'and')
 
         return title.title()
+
+    def _song_title_match_variants(self, title: str) -> List[str]:
+        """Generate normalized title variants for fuzzy song-to-folder matching."""
+        variants: List[str] = []
+
+        def add_variant(value: str) -> None:
+            normalized = re.sub(r"[^a-z0-9]+", ' ', value.lower())
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            if normalized and normalized not in variants:
+                variants.append(normalized)
+
+        cleaned = title.replace('&', 'and')
+        add_variant(cleaned)
+
+        no_parenthetical = re.sub(r'\s*\([^)]*\)', '', cleaned).strip()
+        add_variant(no_parenthetical)
+
+        no_leading_article = re.sub(r'^(the|a|an)\s+', '', no_parenthetical, flags=re.IGNORECASE).strip()
+        add_variant(no_leading_article)
+
+        return variants
 
     def _find_stems_in_song_folder(self, song_folder: Path, song_title: str, extensions: List[str]) -> List[AudioStem]:
         """Find all stems within a song folder, handling different architectures."""
