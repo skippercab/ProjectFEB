@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple launcher script for Project FEB."""
+"""Simple launcher script for Rider."""
 
 import sys
 from pathlib import Path

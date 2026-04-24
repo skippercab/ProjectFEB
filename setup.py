@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Setup script for Project FEB."""
+"""Setup script for Rider."""
 
 import sys
 import json
@@ -8,7 +8,7 @@ from typing import Dict, Any
 
 def main():
     """Run the setup process."""
-    print("🎵 Project FEB Setup")
+    print("🎵 Rider Setup")
     print("=" * 50)
 
     # Check Python version
@@ -50,6 +50,7 @@ def main():
     print("\n📦 Checking dependencies...")
     try:
         import customtkinter
+        import PIL
         import requests
         import fuzzywuzzy
         print("✅ Core dependencies are installed")
@@ -58,7 +59,7 @@ def main():
         print(f"Error: {e}")
 
     print("\n🎉 Setup complete!")
-    print("Run 'python -m projectfeb' to start the application.")
+    print("Run Rider with 'python -m projectfeb'.")
 
 def get_default_config() -> Dict[str, Any]:
     """Get default configuration."""

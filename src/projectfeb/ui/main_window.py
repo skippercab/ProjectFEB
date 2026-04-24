@@ -1,4 +1,8 @@
-"""Main GUI window for Project FEB."""
+"""Main GUI window for Rider."""
+
+import ctypes
+import sys
+import tkinter as tk
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -10,6 +14,7 @@ import json
 import threading
 import queue
 from dataclasses import asdict
+from PIL import Image, ImageTk
 
 from ..core.config import Config, default_output_buses
 from ..services.pco_service import (
@@ -17,6 +22,204 @@ from ..services.pco_service import (
 )
 from ..services.multitracks_service import MultitracksService, StemMatch, AudioStem
 from ..services.ableton_service import AbletonService
+
+
+RIDER_FONT_FAMILY = "Gotham Narrow"
+
+
+RIDER_COLORS = {
+    "corona_gold": "#D4AF37",
+    "midnight_indigo": "#1A1C2C",
+    "satchel_tan": "#A67C52",
+    "stems_violet": "#8E44AD",
+    "waveform_teal": "#16A085",
+    "glow_amber": "#FFD700",
+    "pure_white": "#FFFFFF",
+    "obsidian_black": "#000000",
+}
+
+RIDER_THEME = {
+    "app_bg": (RIDER_COLORS["pure_white"], RIDER_COLORS["midnight_indigo"]),
+    "surface": ("#FBF7EF", "#242738"),
+    "surface_alt": ("#F4E8D7", "#2C3145"),
+    "surface_input": (RIDER_COLORS["pure_white"], "#202433"),
+    "surface_overlay": ("#FFF7E3", "#2A2E42"),
+    "border": ("#E3C768", RIDER_COLORS["satchel_tan"]),
+    "text_primary": (RIDER_COLORS["obsidian_black"], RIDER_COLORS["pure_white"]),
+    "text_muted": ("#5F4B32", "#D8CBAE"),
+    "text_accent": ("#8A6A1F", RIDER_COLORS["corona_gold"]),
+    "primary": ("#B78A1E", RIDER_COLORS["corona_gold"]),
+    "primary_hover": ("#C99A27", RIDER_COLORS["glow_amber"]),
+    "secondary": (RIDER_COLORS["satchel_tan"], RIDER_COLORS["satchel_tan"]),
+    "secondary_hover": ("#B98A5A", "#C29463"),
+    "accent": (RIDER_COLORS["stems_violet"], RIDER_COLORS["stems_violet"]),
+    "accent_hover": ("#9B59B6", "#A66BC2"),
+    "teal": (RIDER_COLORS["waveform_teal"], RIDER_COLORS["waveform_teal"]),
+    "teal_hover": ("#1ABC9C", "#1ABC9C"),
+    "warning": ("#B8860B", RIDER_COLORS["glow_amber"]),
+    "success": (RIDER_COLORS["waveform_teal"], "#6FD2BF"),
+    "button_text_primary": (RIDER_COLORS["pure_white"], RIDER_COLORS["pure_white"]),
+    "button_text_dark": (RIDER_COLORS["obsidian_black"], RIDER_COLORS["obsidian_black"]),
+    "button_text_light": (RIDER_COLORS["pure_white"], RIDER_COLORS["pure_white"]),
+}
+
+
+def register_rider_font_assets(fonts_path: Path) -> None:
+    """Register bundled Gotham Narrow fonts so Tk can use them at runtime."""
+    font_files = sorted(fonts_path.glob("*.otf")) + sorted(fonts_path.glob("*.ttf"))
+    if not font_files:
+        logger.debug(f"No Rider font files found in {fonts_path}")
+        return
+
+    if sys.platform == "darwin":
+        try:
+            cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            ct = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreText.framework/CoreText")
+
+            cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+            cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            cf.CFRelease.restype = None
+
+            ct.CTFontManagerRegisterFontsForURL.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+            ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+
+            for font_file in font_files:
+                url = cf.CFURLCreateFromFileSystemRepresentation(
+                    None,
+                    str(font_file).encode("utf-8"),
+                    len(str(font_file).encode("utf-8")),
+                    False,
+                )
+                if not url:
+                    continue
+                error_ref = ctypes.c_void_p()
+                ct.CTFontManagerRegisterFontsForURL(url, 1, ctypes.byref(error_ref))
+                cf.CFRelease(url)
+        except Exception as exc:
+            logger.warning(f"Failed to register Rider font assets on macOS: {exc}")
+    else:
+        for font_file in font_files:
+            try:
+                ctk.FontManager.load_font(str(font_file))
+            except Exception as exc:
+                logger.warning(f"Failed to register Rider font asset {font_file.name}: {exc}")
+
+
+def rider_font(size: int, *, weight: str = "normal", slant: str = "roman") -> ctk.CTkFont:
+    return ctk.CTkFont(family=RIDER_FONT_FAMILY, size=size, weight=weight, slant=slant)
+
+
+def rider_strong_label_font(size: int) -> ctk.CTkFont:
+    return ctk.CTkFont(family="Gotham Bold", size=size, weight="bold")
+
+
+def rider_card_style(*, elevated: bool = False) -> dict[str, object]:
+    return {
+        "fg_color": RIDER_THEME["surface_alt"] if elevated else RIDER_THEME["surface"],
+        "border_color": RIDER_THEME["border"],
+        "border_width": 1,
+        "corner_radius": 16,
+    }
+
+
+def rider_button_style(role: str = "secondary") -> dict[str, object]:
+    if role == "primary":
+        return {
+            "fg_color": RIDER_THEME["primary"],
+            "hover_color": RIDER_THEME["primary_hover"],
+            "text_color": RIDER_THEME["button_text_primary"],
+            "font": rider_font(13, weight="bold"),
+        }
+    if role == "accent":
+        return {
+            "fg_color": RIDER_THEME["accent"],
+            "hover_color": RIDER_THEME["accent_hover"],
+            "text_color": RIDER_THEME["button_text_light"],
+            "font": rider_font(13, weight="bold"),
+        }
+    if role == "teal":
+        return {
+            "fg_color": RIDER_THEME["teal"],
+            "hover_color": RIDER_THEME["teal_hover"],
+            "text_color": RIDER_THEME["button_text_light"],
+            "font": rider_font(13, weight="bold"),
+        }
+    return {
+        "fg_color": RIDER_THEME["secondary"],
+        "hover_color": RIDER_THEME["secondary_hover"],
+        "text_color": RIDER_THEME["button_text_light"],
+        "font": rider_font(13, weight="bold"),
+    }
+
+
+def rider_entry_style() -> dict[str, object]:
+    return {
+        "fg_color": RIDER_THEME["surface_input"],
+        "border_color": RIDER_THEME["border"],
+        "text_color": RIDER_THEME["text_primary"],
+        "placeholder_text_color": RIDER_THEME["text_muted"],
+        "font": rider_font(13),
+    }
+
+
+def rider_combo_style() -> dict[str, object]:
+    return {
+        "fg_color": RIDER_THEME["surface_input"],
+        "border_color": RIDER_THEME["border"],
+        "button_color": RIDER_THEME["secondary"],
+        "button_hover_color": RIDER_THEME["primary_hover"],
+        "text_color": RIDER_THEME["text_primary"],
+        "font": rider_font(13),
+        "dropdown_font": rider_font(13),
+        "dropdown_fg_color": RIDER_THEME["surface_input"],
+        "dropdown_hover_color": RIDER_THEME["surface_alt"],
+        "dropdown_text_color": RIDER_THEME["text_primary"],
+    }
+
+
+def rider_option_menu_style() -> dict[str, object]:
+    return {
+        "fg_color": RIDER_THEME["secondary"],
+        "button_color": RIDER_THEME["secondary"],
+        "button_hover_color": RIDER_THEME["primary_hover"],
+        "text_color": RIDER_THEME["button_text_light"],
+        "font": rider_font(12, weight="bold"),
+        "dropdown_font": rider_font(12),
+        "dropdown_fg_color": RIDER_THEME["surface_input"],
+        "dropdown_hover_color": RIDER_THEME["surface_alt"],
+        "dropdown_text_color": RIDER_THEME["text_primary"],
+    }
+
+
+def rider_checkbox_style() -> dict[str, object]:
+    return {
+        "fg_color": RIDER_THEME["accent"],
+        "hover_color": RIDER_THEME["accent_hover"],
+        "border_color": RIDER_THEME["border"],
+        "checkmark_color": RIDER_THEME["button_text_light"],
+        "text_color": RIDER_THEME["text_primary"],
+        "font": rider_font(12),
+    }
+
+
+def rider_switch_style() -> dict[str, object]:
+    return {
+        "fg_color": RIDER_THEME["border"],
+        "progress_color": RIDER_THEME["accent"],
+        "button_color": RIDER_THEME["surface_input"],
+        "button_hover_color": RIDER_THEME["primary_hover"],
+        "text_color": RIDER_THEME["text_primary"],
+        "font": rider_font(13),
+    }
+
+
+def rider_title_label_style() -> dict[str, object]:
+    return {"text_color": RIDER_THEME["text_accent"]}
+
+
+def rider_body_label_style() -> dict[str, object]:
+    return {"text_color": RIDER_THEME["text_primary"]}
 
 class ProjectFEBApp:
     """Main application window."""
@@ -49,6 +252,10 @@ class ProjectFEBApp:
         self.loading_status_pulse_on = False
         self.suppress_selection_callbacks = False
         self.pending_ui_callbacks: queue.Queue[Callable[[], None]] = queue.Queue()
+        self.assets_path = Path(__file__).parent.parent.parent.parent / "img"
+        self.fonts_path = Path(__file__).parent.parent.parent.parent / "font"
+        self.app_icon_image: Optional[ImageTk.PhotoImage] = None
+        self.brand_logo_image: Optional[ctk.CTkImage] = None
 
         # Preferences file
         self.preferences_path = Path(__file__).parent.parent.parent.parent / "config" / "preferences.json"
@@ -58,49 +265,175 @@ class ProjectFEBApp:
         # Setup GUI
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
+        register_rider_font_assets(self.fonts_path)
+        ctk.ThemeManager.theme["CTkFont"]["family"] = RIDER_FONT_FAMILY
 
         self.root = ctk.CTk()
-        self.root.title("Project FEB - Planning Center to Ableton")
-        self.root.geometry("1000x700")
+        self.root.configure(fg_color=RIDER_THEME["app_bg"])
+        self.root.title("Rider: The Final Editing Bridge")
+        self.root.geometry("1000x760")
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self._apply_window_icon()
 
         self._create_widgets()
+        self._fit_window_to_content()
         self.root.after(50, self._process_pending_ui_callbacks)
         self.root.after(4000, self._refresh_loading_status_heartbeat)
         self._load_initial_data()
 
+    def _fit_window_to_content(self) -> None:
+        """Ensure the launch window is tall and wide enough for the full landing layout."""
+        self.root.update_idletasks()
+        required_width = self.root.winfo_reqwidth() + 24
+        required_height = self.root.winfo_reqheight() + 24
+        fitted_width = max(1000, required_width)
+        fitted_height = max(760, required_height)
+        self.root.geometry(f"{fitted_width}x{fitted_height}")
+        self.root.minsize(fitted_width, fitted_height)
+
+    def _apply_window_icon(self) -> None:
+        """Load the Rider app icon for the runtime window and dock."""
+        icon_path = self.assets_path / "icon.png"
+        if not icon_path.exists():
+            logger.debug(f"Rider icon not found at {icon_path}")
+            return
+
+        try:
+            padded_icon = self._build_padded_app_icon(icon_path)
+            self.app_icon_image = ImageTk.PhotoImage(padded_icon)
+            self.root.iconphoto(True, self.app_icon_image)
+        except Exception as exc:
+            logger.warning(f"Failed to load Rider icon from {icon_path}: {exc}")
+
+    def _build_padded_app_icon(self, icon_path: Path) -> Image.Image:
+        """Center the provided icon in a slightly roomier square so it matches macOS dock scale better."""
+        canvas_size = 1024
+        safe_area_ratio = 0.84
+
+        with Image.open(icon_path) as image:
+            rgba_image = image.convert("RGBA")
+            alpha_bbox = rgba_image.getchannel("A").getbbox()
+            if alpha_bbox is not None:
+                rgba_image = rgba_image.crop(alpha_bbox)
+
+            max_icon_size = int(canvas_size * safe_area_ratio)
+            resized_width, resized_height = self._scaled_image_size(
+                rgba_image.size,
+                max_width=max_icon_size,
+                max_height=max_icon_size,
+            )
+            resized_icon = rgba_image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+
+        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+        paste_x = (canvas_size - resized_width) // 2
+        paste_y = (canvas_size - resized_height) // 2
+        canvas.alpha_composite(resized_icon, (paste_x, paste_y))
+        return canvas
+
+    def _load_brand_logo(self) -> Optional[ctk.CTkImage]:
+        """Load a cropped light/dark logo pair for the app header."""
+        light_logo_path = self.assets_path / "blackLogo.png"
+        dark_logo_path = self.assets_path / "whiteLogo.png"
+        if not light_logo_path.exists() or not dark_logo_path.exists():
+            logger.debug("Rider logo files are missing; falling back to text header")
+            return None
+
+        try:
+            light_logo = self._load_cropped_rgba(light_logo_path)
+            dark_logo = self._load_cropped_rgba(dark_logo_path)
+        except Exception as exc:
+            logger.warning(f"Failed to load Rider logos: {exc}")
+            return None
+
+        width, height = self._scaled_image_size(light_logo.size, max_width=460, max_height=150)
+        self.brand_logo_image = ctk.CTkImage(
+            light_image=light_logo,
+            dark_image=dark_logo,
+            size=(width, height),
+        )
+        return self.brand_logo_image
+
+    def _load_cropped_rgba(self, image_path: Path) -> Image.Image:
+        """Trim transparent padding so the provided logos render at a sensible size."""
+        with Image.open(image_path) as image:
+            rgba_image = image.convert("RGBA")
+            alpha_bbox = rgba_image.getchannel("A").getbbox()
+            if alpha_bbox is not None:
+                rgba_image = rgba_image.crop(alpha_bbox)
+            return rgba_image.copy()
+
+    def _scaled_image_size(
+        self,
+        original_size: tuple[int, int],
+        *,
+        max_width: int,
+        max_height: int,
+    ) -> tuple[int, int]:
+        """Scale an image to fit within the requested bounds without distorting it."""
+        original_width, original_height = original_size
+        if original_width <= 0 or original_height <= 0:
+            return max_width, max_height
+
+        scale = min(max_width / original_width, max_height / original_height, 1.0)
+        scaled_width = max(1, int(original_width * scale))
+        scaled_height = max(1, int(original_height * scale))
+        return scaled_width, scaled_height
+
     def _create_widgets(self):
         """Create the main GUI widgets."""
         # Main container
-        self.main_frame = ctk.CTkFrame(self.root)
+        self.main_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Title
-        title_label = ctk.CTkLabel(
-            self.main_frame,
-            text="Project FEB",
-            font=ctk.CTkFont(size=24, weight="bold")
-        )
-        title_label.pack(pady=(20, 10))
+        # Brand header
+        brand_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        brand_frame.pack(fill="x", pady=(20, 10))
+
+        brand_logo = self._load_brand_logo()
+        if brand_logo is not None:
+            brand_logo_label = ctk.CTkLabel(
+                brand_frame,
+                text="",
+                image=brand_logo,
+            )
+            brand_logo_label.pack()
+        else:
+            title_label = ctk.CTkLabel(
+                brand_frame,
+                text="Rider",
+                font=rider_font(24, weight="bold"),
+                **rider_title_label_style(),
+            )
+            title_label.pack(pady=(0, 8))
+
+            subtitle_label = ctk.CTkLabel(
+                brand_frame,
+                text="The Final Editing Bridge",
+                font=rider_font(14),
+                **rider_body_label_style(),
+            )
+            subtitle_label.pack()
 
         # Selection section (Folder -> Service Type -> Plan)
-        selection_frame = ctk.CTkFrame(self.main_frame)
+        selection_frame = ctk.CTkFrame(self.main_frame, **rider_card_style())
         selection_frame.pack(fill="x", padx=20, pady=(0, 10))
 
         # Folder selection
         folder_label = ctk.CTkLabel(
             selection_frame,
             text="1. Select Campus/Folder:",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=rider_strong_label_font(13),
+            **rider_title_label_style(),
         )
-        folder_label.pack(anchor="w", pady=(10, 2))
+        folder_label.pack(anchor="w", padx=20, pady=(10, 2))
 
         self.folder_var = ctk.StringVar()
         self.folder_combo = ctk.CTkComboBox(
             selection_frame,
             variable=self.folder_var,
             state="readonly",
-            command=self._on_folder_selected
+            command=self._on_folder_selected,
+            **rider_combo_style(),
         )
         self.folder_combo.pack(fill="x", padx=20, pady=(0, 10))
 
@@ -108,16 +441,18 @@ class ProjectFEBApp:
         service_type_label = ctk.CTkLabel(
             selection_frame,
             text="2. Select Service Type:",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=rider_strong_label_font(13),
+            **rider_title_label_style(),
         )
-        service_type_label.pack(anchor="w", pady=(10, 2))
+        service_type_label.pack(anchor="w", padx=20, pady=(10, 2))
 
         self.service_type_var = ctk.StringVar()
         self.service_type_combo = ctk.CTkComboBox(
             selection_frame,
             variable=self.service_type_var,
             state="readonly",
-            command=self._on_service_type_selected
+            command=self._on_service_type_selected,
+            **rider_combo_style(),
         )
         self.service_type_combo.pack(fill="x", padx=20, pady=(0, 10))
         self.service_type_combo.configure(values=["Loading..."])
@@ -127,16 +462,18 @@ class ProjectFEBApp:
         plan_label = ctk.CTkLabel(
             selection_frame,
             text="3. Select Service Plan:",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=rider_strong_label_font(13),
+            **rider_title_label_style(),
         )
-        plan_label.pack(anchor="w", pady=(10, 2))
+        plan_label.pack(anchor="w", padx=20, pady=(10, 2))
 
         self.service_var = ctk.StringVar()
         self.service_combo = ctk.CTkComboBox(
             selection_frame,
             variable=self.service_var,
             state="readonly",
-            command=self._on_service_selected
+            command=self._on_service_selected,
+            **rider_combo_style(),
         )
         self.service_combo.pack(fill="x", padx=20, pady=(0, 10))
         self.service_combo.configure(values=["Loading..."])
@@ -147,27 +484,39 @@ class ProjectFEBApp:
             selection_frame,
             text="Refresh",
             command=self._load_folders,
-            width=100
+            width=100,
+            **rider_button_style("teal"),
         )
-        self.refresh_btn.pack(pady=(10, 0))
+        self.refresh_btn.pack(pady=(10, 14))
 
         # Stem matching section
-        stems_frame = ctk.CTkFrame(self.main_frame)
+        stems_frame = ctk.CTkFrame(self.main_frame, **rider_card_style())
         stems_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         stems_label = ctk.CTkLabel(
             stems_frame,
             text="Stem Matching Results:",
-            font=ctk.CTkFont(size=16, weight="bold")
+            font=rider_font(16, weight="bold"),
+            **rider_title_label_style(),
         )
         stems_label.pack(pady=(10, 5))
 
         # Results text area
-        self.results_text = ctk.CTkTextbox(stems_frame, wrap="word")
+        self.results_text = ctk.CTkTextbox(
+            stems_frame,
+            wrap="word",
+            fg_color=RIDER_THEME["surface_input"],
+            border_color=RIDER_THEME["border"],
+            border_width=1,
+            text_color=RIDER_THEME["text_primary"],
+            font=rider_font(13),
+            scrollbar_button_color=RIDER_THEME["secondary"],
+            scrollbar_button_hover_color=RIDER_THEME["primary_hover"],
+        )
         self.results_text.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         # Action buttons
-        buttons_frame = ctk.CTkFrame(self.main_frame)
+        buttons_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         buttons_frame.pack(fill="x", padx=20, pady=(0, 20))
 
         # Left side buttons
@@ -177,7 +526,8 @@ class ProjectFEBApp:
         self.settings_btn = ctk.CTkButton(
             left_buttons,
             text="Settings",
-            command=self._open_settings
+            command=self._open_settings,
+            **rider_button_style("secondary"),
         )
         self.settings_btn.pack(side="left", padx=(0, 10))
 
@@ -189,33 +539,43 @@ class ProjectFEBApp:
             right_buttons,
             text="Generate Setlist",
             command=self._generate_setlist,
-            fg_color="green",
-            hover_color="dark green",
-            state="disabled"
+            state="disabled",
+            **rider_button_style("primary"),
         )
         self.generate_btn.pack(side="right")
 
         self.resolve_unknown_btn = ctk.CTkButton(
             right_buttons,
             text="Resolve Unknown Stems",
-            command=lambda: self._resolve_unknown_stems(show_success_if_none=True)
+            command=lambda: self._resolve_unknown_stems(show_success_if_none=True),
+            **rider_button_style("accent"),
         )
         self.resolve_unknown_btn.pack(side="right", padx=(0, 10))
 
-        self.loading_overlay = ctk.CTkFrame(self.main_frame, corner_radius=16)
+        self.loading_overlay = ctk.CTkFrame(self.main_frame, **rider_card_style(elevated=True))
         self.loading_status_var = ctk.StringVar(value="")
         ctk.CTkLabel(
             self.loading_overlay,
             text="Working...",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=rider_font(18, weight="bold"),
+            **rider_title_label_style(),
         ).pack(padx=24, pady=(20, 8))
         ctk.CTkLabel(
             self.loading_overlay,
             textvariable=self.loading_status_var,
             wraplength=320,
             justify="center",
+            font=rider_font(13),
+            **rider_body_label_style(),
         ).pack(padx=24, pady=(0, 12))
-        self.loading_progress = ctk.CTkProgressBar(self.loading_overlay, mode="indeterminate", width=240)
+        self.loading_progress = ctk.CTkProgressBar(
+            self.loading_overlay,
+            mode="indeterminate",
+            width=240,
+            fg_color=RIDER_THEME["surface_input"],
+            progress_color=RIDER_THEME["teal"],
+            border_color=RIDER_THEME["border"],
+        )
         self.loading_progress.pack(padx=24, pady=(0, 20))
         self.loading_overlay.place_forget()
 
@@ -925,6 +1285,7 @@ class SettingsDialog:
         
         # Create dialog window
         self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.configure(fg_color=RIDER_THEME["app_bg"])
         self.dialog.title("Settings")
         self.dialog.geometry("860x980")
         self.dialog.resizable(True, True)
@@ -937,14 +1298,15 @@ class SettingsDialog:
     
     def _create_widgets(self):
         """Create the settings dialog widgets."""
-        main_frame = ctk.CTkScrollableFrame(self.dialog)
+        main_frame = ctk.CTkScrollableFrame(self.dialog, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=15, pady=15)
         
         # Title
         title = ctk.CTkLabel(
             main_frame,
             text="Application Settings",
-            font=ctk.CTkFont(size=18, weight="bold")
+            font=rider_font(18, weight="bold"),
+            **rider_title_label_style(),
         )
         title.pack(pady=(0, 20))
         
@@ -993,7 +1355,8 @@ class SettingsDialog:
 
         self.sub_master_switch = ctk.CTkSwitch(
             ab_frame,
-            text="Enable internal Sub Master monitoring bus"
+            text="Enable internal Sub Master monitoring bus",
+            **rider_switch_style(),
         )
         self.sub_master_switch.pack(anchor="w", pady=(0, 10))
         if self.config.ableton.enable_sub_master:
@@ -1016,22 +1379,23 @@ class SettingsDialog:
             button_frame,
             text="Save Settings",
             command=self._save_settings,
-            fg_color="green",
-            hover_color="dark green"
+            **rider_button_style("primary"),
         )
         save_btn.pack(side="left", padx=(0, 10))
         
         cancel_btn = ctk.CTkButton(
             button_frame,
             text="Cancel",
-            command=self.dialog.destroy
+            command=self.dialog.destroy,
+            **rider_button_style("secondary"),
         )
         cancel_btn.pack(side="left")
         
         test_btn = ctk.CTkButton(
             button_frame,
             text="Test Connection",
-            command=self._test_connection
+            command=self._test_connection,
+            **rider_button_style("teal"),
         )
         test_btn.pack(side="right")
     
@@ -1043,47 +1407,58 @@ class SettingsDialog:
         title_label = ctk.CTkLabel(
             frame,
             text=title,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#4da6ff"
+            font=rider_font(13, weight="bold"),
+            **rider_title_label_style(),
         )
         title_label.pack(anchor="w", pady=(0, 10))
         
-        content_frame = ctk.CTkFrame(frame)
-        content_frame.pack(fill="x", padx=15)
-        
+        content_card = ctk.CTkFrame(frame, **rider_card_style())
+        content_card.pack(fill="x", padx=15)
+
+        content_frame = ctk.CTkFrame(content_card, fg_color="transparent")
+        content_frame.pack(fill="x", expand=True, padx=14, pady=14)
+
         return content_frame
+
+    def _create_field_group(self, parent) -> ctk.CTkFrame:
+        """Create a consistent container for one labeled field block."""
+        group = ctk.CTkFrame(parent, fg_color="transparent")
+        group.pack(fill="x", pady=(0, 14))
+        return group
     
     def _create_text_field(self, parent, label: str, value: str, show: str = None) -> ctk.CTkEntry:
         """Create a text input field."""
-        label_widget = ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=11))
+        group = self._create_field_group(parent)
+
+        label_widget = ctk.CTkLabel(group, text=label, font=rider_font(11), **rider_body_label_style())
         label_widget.pack(anchor="w", pady=(0, 3))
         
-        entry = ctk.CTkEntry(parent, show=show)
+        entry = ctk.CTkEntry(group, show=show, **rider_entry_style())
         entry.insert(0, value)
-        entry.pack(fill="x", pady=(0, 12))
+        entry.pack(fill="x")
         
         return entry
     
     def _create_file_field(self, parent, label: str, value: str, is_directory: bool = False) -> ctk.CTkFrame:
         """Create a file/folder selection field."""
-        container = ctk.CTkFrame(parent, fg_color="transparent")
-        container.pack(fill="x", pady=(0, 12))
+        container = self._create_field_group(parent)
         
-        label_widget = ctk.CTkLabel(container, text=label, font=ctk.CTkFont(size=11))
+        label_widget = ctk.CTkLabel(container, text=label, font=rider_font(11), **rider_body_label_style())
         label_widget.pack(anchor="w", pady=(0, 3))
         
-        input_frame = ctk.CTkFrame(container)
+        input_frame = ctk.CTkFrame(container, fg_color="transparent")
         input_frame.pack(fill="x")
         
-        entry = ctk.CTkEntry(input_frame)
+        entry = ctk.CTkEntry(input_frame, **rider_entry_style())
         entry.insert(0, value)
-        entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
         browse_btn = ctk.CTkButton(
             input_frame,
             text="Browse",
             width=80,
-            command=lambda: self._browse_path(entry, is_directory)
+            command=lambda: self._browse_path(entry, is_directory),
+            **rider_button_style("secondary"),
         )
         browse_btn.pack(side="right")
         
@@ -1116,7 +1491,9 @@ class SettingsDialog:
                 "Content buses can use up to 6 total lanes. Stereo buses must start on 1, 3, 5, or 7."
             ),
             justify="left",
-            font=ctk.CTkFont(size=11)
+            wraplength=760,
+            font=rider_font(11),
+            **rider_body_label_style(),
         )
         description.pack(anchor="w", pady=(0, 8))
 
@@ -1124,7 +1501,8 @@ class SettingsDialog:
             parent,
             text="",
             justify="left",
-            font=ctk.CTkFont(size=11, weight="bold")
+            font=rider_font(11, weight="bold"),
+            **rider_body_label_style(),
         )
         self.output_bus_summary_label.pack(anchor="w", pady=(0, 10))
 
@@ -1133,13 +1511,14 @@ class SettingsDialog:
         except Exception:
             output_buses = AbletonService.validate_output_buses(default_output_buses())
 
-        special_frame = ctk.CTkFrame(parent)
+        special_frame = ctk.CTkFrame(parent, **rider_card_style(elevated=True))
         special_frame.pack(fill="x", pady=(0, 12))
 
         special_title = ctk.CTkLabel(
             special_frame,
             text="Special Buses",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=rider_font(12, weight="bold"),
+            **rider_title_label_style(),
         )
         special_title.pack(anchor="w", padx=12, pady=(10, 8))
 
@@ -1148,7 +1527,7 @@ class SettingsDialog:
         self._create_special_bus_row(special_frame, 'click', click_bus)
         self._create_special_bus_row(special_frame, 'guide', guide_bus)
 
-        content_frame = ctk.CTkFrame(parent)
+        content_frame = ctk.CTkFrame(parent, **rider_card_style(elevated=True))
         content_frame.pack(fill="both", expand=True, pady=(0, 12))
 
         header_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
@@ -1157,7 +1536,8 @@ class SettingsDialog:
         content_title = ctk.CTkLabel(
             header_frame,
             text="Content Buses",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=rider_font(12, weight="bold"),
+            **rider_title_label_style(),
         )
         content_title.pack(side="left")
 
@@ -1166,6 +1546,7 @@ class SettingsDialog:
             text="Add Content Bus",
             width=140,
             command=self._add_content_bus_row,
+            **rider_button_style("teal"),
         )
         add_bus_btn.pack(side="right")
 
@@ -1173,7 +1554,8 @@ class SettingsDialog:
             content_frame,
             text="Pick a slot, mono/stereo mode, a freeform name, and the routing tags that should feed that bus.",
             justify="left",
-            font=ctk.CTkFont(size=11)
+            font=rider_font(11),
+            **rider_body_label_style(),
         )
         helper_label.pack(anchor="w", padx=12, pady=(0, 8))
 
@@ -1188,36 +1570,40 @@ class SettingsDialog:
 
     def _create_special_bus_row(self, parent, role: str, bus: dict) -> None:
         """Create a compact editor row for Click or Guide."""
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(parent, **rider_card_style())
         frame.pack(fill="x", padx=12, pady=(0, 10))
+
+        frame.grid_columnconfigure(5, weight=1)
 
         role_label = ctk.CTkLabel(
             frame,
             text=role.title(),
             width=80,
             anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=rider_font(12, weight="bold"),
+            **rider_title_label_style(),
         )
-        role_label.pack(side="left", padx=(10, 10), pady=10)
+        role_label.grid(row=0, column=0, padx=(12, 10), pady=10, sticky="w")
 
-        slot_label = ctk.CTkLabel(frame, text="Return Slot", width=80)
-        slot_label.pack(side="left", padx=(0, 6))
+        slot_label = ctk.CTkLabel(frame, text="Return Slot", width=80, **rider_body_label_style())
+        slot_label.grid(row=0, column=1, padx=(0, 6), pady=10, sticky="w")
 
         slot_menu = ctk.CTkOptionMenu(
             frame,
             values=self.MONO_SLOT_VALUES,
             width=90,
-            command=lambda _value: self._update_output_bus_summary()
+            command=lambda _value: self._update_output_bus_summary(),
+            **rider_option_menu_style(),
         )
         slot_menu.set(str(bus.get('slot', 7 if role == 'click' else 8)))
-        slot_menu.pack(side="left", padx=(0, 12))
+        slot_menu.grid(row=0, column=2, padx=(0, 12), pady=10, sticky="w")
 
-        name_label = ctk.CTkLabel(frame, text="Bus Name", width=70)
-        name_label.pack(side="left", padx=(0, 6))
+        name_label = ctk.CTkLabel(frame, text="Bus Name", width=70, **rider_body_label_style())
+        name_label.grid(row=0, column=3, padx=(0, 6), pady=10, sticky="w")
 
-        name_entry = ctk.CTkEntry(frame)
+        name_entry = ctk.CTkEntry(frame, **rider_entry_style())
         name_entry.insert(0, bus.get('name', role.title()))
-        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
+        name_entry.grid(row=0, column=5, padx=(0, 12), pady=10, sticky="ew")
 
         self.special_bus_rows[role] = {
             'slot_menu': slot_menu,
@@ -1234,13 +1620,13 @@ class SettingsDialog:
             'tags': [],
         }
 
-        frame = ctk.CTkFrame(self.content_bus_container)
+        frame = ctk.CTkFrame(self.content_bus_container, **rider_card_style())
         frame.pack(fill="x", pady=(0, 10))
 
         header = ctk.CTkFrame(frame, fg_color="transparent")
         header.pack(fill="x", padx=10, pady=(10, 6))
 
-        slot_label = ctk.CTkLabel(header, text="Slot")
+        slot_label = ctk.CTkLabel(header, text="Slot", **rider_body_label_style())
         slot_label.pack(side="left", padx=(0, 6))
 
         slot_values = self.STEREO_SLOT_VALUES if bus.get('mode') == 'stereo' else self.MONO_SLOT_VALUES
@@ -1248,14 +1634,15 @@ class SettingsDialog:
             header,
             values=slot_values,
             width=90,
-            command=lambda _value: self._update_output_bus_summary()
+            command=lambda _value: self._update_output_bus_summary(),
+            **rider_option_menu_style(),
         )
         slot_menu.set(str(bus.get('slot', slot_values[0])))
         if slot_menu.get() not in slot_values:
             slot_menu.set(slot_values[0])
         slot_menu.pack(side="left", padx=(0, 12))
 
-        mode_label = ctk.CTkLabel(header, text="Mode")
+        mode_label = ctk.CTkLabel(header, text="Mode", **rider_body_label_style())
         mode_label.pack(side="left", padx=(0, 6))
 
         row: dict = {'frame': frame}
@@ -1263,15 +1650,16 @@ class SettingsDialog:
             header,
             values=['mono', 'stereo'],
             width=100,
-            command=lambda value, row=row: self._on_content_mode_changed(row, value)
+            command=lambda value, row=row: self._on_content_mode_changed(row, value),
+            **rider_option_menu_style(),
         )
         mode_menu.set(bus.get('mode', 'mono'))
         mode_menu.pack(side="left", padx=(0, 12))
 
-        name_label = ctk.CTkLabel(header, text="Bus Name")
+        name_label = ctk.CTkLabel(header, text="Bus Name", **rider_body_label_style())
         name_label.pack(side="left", padx=(0, 6))
 
-        name_entry = ctk.CTkEntry(header)
+        name_entry = ctk.CTkEntry(header, **rider_entry_style())
         name_entry.insert(0, bus.get('name', ''))
         name_entry.pack(side="left", fill="x", expand=True, padx=(0, 12))
 
@@ -1279,19 +1667,19 @@ class SettingsDialog:
             header,
             text="Remove",
             width=80,
-            fg_color="#7a2f2f",
-            hover_color="#5c2323",
             command=lambda row=row: self._remove_content_bus_row(row),
+            **rider_button_style("secondary"),
         )
         remove_btn.pack(side="right")
 
-        tags_frame = ctk.CTkFrame(frame)
+        tags_frame = ctk.CTkFrame(frame, **rider_card_style(elevated=True))
         tags_frame.pack(fill="x", padx=10, pady=(0, 10))
 
         tags_label = ctk.CTkLabel(
             tags_frame,
             text="Routing Tags",
-            font=ctk.CTkFont(size=11, weight="bold")
+            font=rider_font(11, weight="bold"),
+            **rider_title_label_style(),
         )
         tags_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 6))
 
@@ -1301,7 +1689,8 @@ class SettingsDialog:
             checkbox = ctk.CTkCheckBox(
                 tags_frame,
                 text=tag_label,
-                command=self._update_output_bus_summary
+                command=self._update_output_bus_summary,
+                **rider_checkbox_style(),
             )
             if tag_value in selected_tags:
                 checkbox.select()
@@ -1368,7 +1757,7 @@ class SettingsDialog:
         warning_state = bool(overlaps) or content_lanes_used > 6
         self.output_bus_summary_label.configure(
             text=" | ".join(summary_parts),
-            text_color="#d97a00" if warning_state else "#3a7f43"
+            text_color=RIDER_THEME["warning"] if warning_state else RIDER_THEME["success"]
         )
     
     def _save_settings(self):
@@ -1546,19 +1935,21 @@ class UnknownStemResolutionDialog:
                 examples.append(f"{song_title}: {stem.filename}")
 
         self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.configure(fg_color=RIDER_THEME["app_bg"])
         self.dialog.title("Resolve Unknown Stems")
         self.dialog.geometry("920x640")
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
-        main_frame = ctk.CTkScrollableFrame(self.dialog)
+        main_frame = ctk.CTkScrollableFrame(self.dialog, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=15, pady=15)
 
         title = ctk.CTkLabel(
             main_frame,
             text="Resolve Unknown Stem Types",
-            font=ctk.CTkFont(size=18, weight="bold")
+            font=rider_font(18, weight="bold"),
+            **rider_title_label_style(),
         )
         title.pack(anchor="w", pady=(0, 8))
 
@@ -1570,12 +1961,14 @@ class UnknownStemResolutionDialog:
             ),
             justify="left",
             wraplength=820,
+            font=rider_font(13),
+            **rider_body_label_style(),
         )
         subtitle.pack(anchor="w", pady=(0, 16))
 
         combo_values = [label for _, label in self.STEM_TYPE_OPTIONS]
         for group in grouped_unknowns.values():
-            row_frame = ctk.CTkFrame(main_frame)
+            row_frame = ctk.CTkFrame(main_frame, **rider_card_style())
             row_frame.pack(fill="x", pady=(0, 10))
 
             ctk.CTkLabel(
@@ -1583,6 +1976,7 @@ class UnknownStemResolutionDialog:
                 text="\n".join(group['examples']),
                 justify="left",
                 anchor="w",
+                **rider_body_label_style(),
             ).pack(fill="x", padx=12, pady=(10, 6))
 
             controls = ctk.CTkFrame(row_frame, fg_color="transparent")
@@ -1593,9 +1987,10 @@ class UnknownStemResolutionDialog:
                 text="Return group",
                 width=120,
                 anchor="w",
+                **rider_body_label_style(),
             ).pack(side="left", padx=(0, 8))
 
-            combo = ctk.CTkComboBox(controls, values=combo_values, state="readonly", width=140)
+            combo = ctk.CTkComboBox(controls, values=combo_values, state="readonly", width=140, **rider_combo_style())
             combo.set('Strings')
             combo.pack(side="left")
 
@@ -1611,13 +2006,13 @@ class UnknownStemResolutionDialog:
             button_row,
             text="Cancel",
             command=self.dialog.destroy,
+            **rider_button_style("secondary"),
         ).pack(side="right")
         ctk.CTkButton(
             button_row,
             text="Save and Continue",
-            fg_color="green",
-            hover_color="dark green",
             command=self._save,
+            **rider_button_style("primary"),
         ).pack(side="right", padx=(0, 8))
 
     def _save(self) -> None:

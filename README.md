@@ -1,215 +1,162 @@
-# Project FEB
+# Rider
 
-A modern Python application that integrates Planning Center Online service plans with Multitracks audio stems to generate Ableton Live 11 setlists.
+Rider: The Final Editing Bridge is a desktop app that turns Planning Center service plans and Multitracks stems into ready-to-open Ableton Live setlists. It pulls the songs for a service, finds the matching audio stems, builds grouped tracks from your template, and generates marker clips and timing data so the set is usable with minimal manual cleanup.
 
 ## Features
 
-- **Planning Center Online Integration**: Fetch service plans and song data
-- **Multitracks Stem Discovery**: Robust fuzzy matching for audio stems
-- **Ableton Live 11 Support**: Generate backward-compatible .als files
-- **Custom Templates**: Use your own Ableton templates with return tracks
-- **Modern GUI**: Clean interface built with customtkinter
+- Planning Center Online plan and song import
+- Multitracks stem discovery with fuzzy song matching
+- Unknown-stem review and remembered stem-type overrides
+- Ableton `.als` generation from a user-supplied template
+- Guide-aware marker clip generation with song-structure alignment
+- Meter-aware behavior for 4/4 and 6/8 songs
+- Regenerated exports use numbered `Regen` filenames instead of overwriting older sets
+- Generated tracks inside groups are ordered naturally by stem name
 
-## Quick Start
+## Requirements
 
-1. **Clone and setup**:
-   ```bash
-   git clone <repository-url>
-   cd project-feb
-   pip install -r requirements.txt
-   python setup.py
-   ```
+- Python 3.12 recommended
+- A Planning Center account with API credentials
+- A local Multitracks stems folder
+- An Ableton Live template `.als` file
 
-2. **Configure your settings** (or edit `config/settings.json`):
-   - Planning Center Online API credentials
-   - Path to your Multitracks stems folder
-   - Path to your Ableton 11 template
+## Installation
 
-3. **Run the application**:
-   ```bash
-   python -m projectfeb
-   ```
+```bash
+git clone <repository-url>
+cd ProjectFEB
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python setup.py
+```
 
-## Detailed Setup
-
-### 1. Planning Center Online Setup
-
-1. Go to [Planning Center API Applications](https://api.planningcenteronline.com/oauth/applications)
-2. Create a new application
-3. Copy the Application ID and Secret to your `config/settings.json`
-
-### 2. Multitracks Setup
-
-Set the `stems_folder` in your configuration to point to your Multitracks stems directory. The app supports:
-- WAV, AIFF, FLAC formats
-- Fuzzy matching for song names
-- Various naming conventions (spaces, underscores, dashes)
-
-### 3. Ableton Live Setup
-
-1. Create your template in Ableton Live 11
-2. Save it to your User Library Templates folder
-3. Set the `template_path` in your configuration
+You can also run the app with an existing compatible virtual environment if you already have one configured.
 
 ## Configuration
 
-The `config/settings.json` file contains:
+Rider reads its settings from `config/settings.json`.
+
+Example:
 
 ```json
 {
-  "planning_center": {
-    "application_id": "your_app_id",
-    "secret": "your_secret"
-  },
-  "multitracks": {
-    "stems_folder": "/path/to/your/stems"
-  },
-  "ableton": {
-    "template_path": "/path/to/your/template.als",
-    "output_folder": "~/Desktop"
-  }
+   "planning_center": {
+      "application_id": "your_app_id",
+      "secret": "your_secret"
+   },
+   "multitracks": {
+      "stems_folder": "/path/to/your/stems"
+   },
+   "ableton": {
+      "template_path": "/path/to/your/template.als",
+      "output_folder": "/path/to/output/folder"
+   }
 }
 ```
 
+You will need:
+
+- Planning Center API credentials from https://api.planningcenteronline.com/oauth/applications
+- A valid local path to your Multitracks stems directory
+- A valid local path to the Ableton template you want to duplicate and populate
+
 ## Usage
 
-1. **Select Service Plan**: Choose from upcoming Planning Center services
-2. **Review Stem Matches**: See which songs have matching audio stems
-3. **Generate Setlist**: Create your Ableton Live project with arranged stems
+1. Launch the app.
+2. Select a Planning Center folder, service type, and plan.
+3. Review the matched stems.
+4. Resolve any unknown stems if prompted.
+5. Generate the setlist.
 
-## Multitracks Integration
+Run it with either of these:
 
-Project FEB supports complex Multitracks folder architectures:
-
-### Supported Folder Structures
-
-The app intelligently discovers stems in various folder layouts:
-
-1. **Direct in Song Folder**:
-   ```
-   Stems/
-   ├── Song Title (Key) [Tempo]/
-   │   ├── AG - Song Title (Key) [Tempo].wav
-   │   ├── Drums - Song Title (Key) [Tempo].wav
-   │   └── Keys - Song Title (Key) [Tempo].wav
-   ```
-
-2. **MultiTracks Subfolder** (Preferred):
-   ```
-   Stems/
-   ├── Song Title (Key) [Tempo]/
-   │   └── MultiTracks/
-   │       ├── Alto.wav
-   │       ├── Drums.wav
-   │       └── Keys.wav
-   ```
-
-3. **Samples/Imported Subfolder**:
-   ```
-   Stems/
-   ├── Song Title (Key) [Tempo]/
-   │   └── Samples/
-   │       └── Imported/
-   │           ├── AG.wav
-   │           ├── Drums.wav
-   │           └── Keys.wav
-   ```
-
-### Song Title Matching
-
-The app automatically extracts clean song titles from folder names:
-
-- `"Again & Again (Db) [115]"` → `"Again And Again"`
-- `"Give Me Jesus (UPPERROOM)"` → `"Give Me Jesus"`
-- `"The Blood (75) [G] sw"` → `"The Blood"`
-
-### Stem Type Detection
-
-Project FEB automatically categorizes stems into your 6 Ableton template groups:
-
-- **Perc** (10 stems): drums, drum, kit, percussion, perc, alt_drums, toms, fx, loop, live
-- **Bass** (6 stems): bass, electric_bass, upright_bass, moog, sub_bass, synth_bass, bbass  
-- **Leads** (0 stems): typically empty, manually select electric guitar stems
-- **Strings** (14 stems): eg, electric, ag, acoustic, guitar, electric_guitar, acoustic_guitar, gtr, strings, violin, viola, cello, orchestral
-- **Keys** (17 stems): keys, keyboard, piano, organ, synth, rhodes, wurlitzer, clav, synth_fx
-- **Vocals** (7 stems): vocals, vocal, vox, lead_vox, bgv, backing_vox, choir, tenor, alto, soprano, bgvs, vox_fx
-- **Guide** (3 stems): guide, metronome, click *(routes to channel 3 in template)*
-
-### Song Discovery Results
-
-Testing with real Multitracks data shows excellent performance:
-- **4/4 songs** successfully matched (100% success rate)
-- **58 total stems** discovered across all songs
-- **ALL stems included** for each matched song (no filtering)
-- **Perfect confidence scores** (100% for all matches)
-- **Excludes metronome files** (classic-*.aif automatically skipped)
-
-**Stem Distribution Examples:**
-- Mighty Name Of Jesus: 21 stems (AG, EG 1-3, Keys 1-5, Piano, Organ, etc.)
-- Give Me Jesus: 10 stems  
-- Again And Again: 17 stems
-- The Blood: 7 stems
-
-## Architecture
-
+```bash
+python run.py
 ```
-projectfeb/
-├── core/           # Configuration and core logic
-├── services/       # External service integrations
-│   ├── pco_service.py         # Planning Center Online
-│   ├── multitracks_service.py # Stem discovery
-│   └── ableton_service.py     # Ableton file generation
-├── ui/             # User interface
-└── utils/          # Utilities and helpers
+
+```bash
+python -m projectfeb
 ```
+
+## Output
+
+Generated Ableton sets are written to the configured `output_folder`.
+
+- The first export uses the base service name and date.
+- Later exports use ` - Regen N` suffixes.
+- Guide tracks and marker clips are generated from the matched stems and song arrangements.
+- Audio tracks are created under grouped song folders using the routing structure from the template.
+
+## Stem Discovery
+
+Rider supports several common Multitracks folder structures, including direct song folders, `MultiTracks/`, and `Samples/Imported/` layouts.
+
+It categorizes stems into the template groups used by the app:
+
+- `perc`
+- `bass`
+- `leads`
+- `strings`
+- `keys`
+- `vocals`
+- `guide`
+
+Song titles are normalized before matching, so common folder modifiers like key, tempo, and switch suffixes do not prevent a match.
 
 ## Development
 
-### Running Tests
+Run tests:
+
 ```bash
 pytest
 ```
 
-### Code Quality
+Common local quality commands:
+
 ```bash
 black src/
 flake8 src/
 mypy src/
 ```
 
-### Building for Distribution
+Build the package:
+
 ```bash
 python setup.py build
 ```
 
 ## Troubleshooting
 
-### Common Issues
+**No service plans found**
 
-**"No service plans found"**
-- Check your Planning Center API credentials
-- Ensure your application has the correct permissions
+- Verify your Planning Center credentials.
+- Confirm the selected folder and service type are correct.
 
-**"No stems found for songs"**
-- Verify your stems folder path
-- Check that audio files are in supported formats
-- Review naming conventions in your stems
+**No stems found**
 
-**"Template file not found"**
-- Ensure your Ableton template exists at the specified path
-- Check file permissions
+- Verify the `stems_folder` path.
+- Confirm the song folders and filenames are present locally.
+- Review any unknown-stem prompts and save overrides when needed.
 
-### Logs
+**Template file not found**
 
-Application logs are written to the console and can be configured to write to files in the `logs/` directory.
+- Verify `template_path` points to an existing `.als` file.
+- Confirm the file is readable from this machine.
 
-## Requirements
+**Generated set looks stale**
 
-- Python 3.8+
-- Planning Center Online account with API access
-- Ableton Live 11 template file
-- Multitracks audio stems folder
+- Check the configured output folder for the newest `Regen` export.
+
+## Project Layout
+
+```text
+src/projectfeb/
+   core/
+   services/
+   ui/
+```
 
 ## License
 
-MIT License - feel free to use and modify as needed.
+MIT License.

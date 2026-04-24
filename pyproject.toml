@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "project-feb"
 version = "2.0.0"
-description = "Planning Center Online to Ableton Live setlist generator"
+description = "Rider: The Final Editing Bridge for Planning Center and Ableton Live setlists"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
@@ -22,6 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "customtkinter>=5.2.0",
+    "Pillow>=10.0.0",
     "requests>=2.28.0",
     "python-dotenv>=1.0.0",
     "pandas>=1.5.0",

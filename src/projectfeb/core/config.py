@@ -1,4 +1,4 @@
-"""Configuration management for Project FEB."""
+"""Configuration management for Rider."""
 
 import json
 import os

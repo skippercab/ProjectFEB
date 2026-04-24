@@ -1,4 +1,4 @@
-"""Logging configuration for Project FEB."""
+"""Logging configuration for Rider."""
 
 import sys
 from pathlib import Path
