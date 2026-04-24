@@ -7,7 +7,6 @@ import subprocess
 import threading
 import zipfile
 import wave
-import audioop
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from pathlib import Path
@@ -23,6 +22,8 @@ import zlib
 import re
 from itertools import combinations
 from tkinter import messagebox, ttk
+import struct
+import numpy as np
 
 from ..core.config import AbletonConfig, default_output_buses
 from ._audio_clip_template import create_audio_clip_template
@@ -62,6 +63,16 @@ class AbletonService:
     GUIDE_TRANSCRIPTION_STRUCTURAL_MATCH_BONUS = 2
     GUIDE_TRANSCRIPTION_CLOSE_MATCH_RATIO = 0.03
     GUIDE_TRANSCRIPTION_GUIDE_NATIVE_MARGIN = 6
+
+    @staticmethod
+    def _calculate_rms(frames: bytes, sample_width: int) -> int:
+        """Calculate RMS value of audio frames. Replaces deprecated audioop.rms() for Python 3.13+."""
+        if not frames or sample_width == 0:
+            return 0
+        fmt = {1: 'B', 2: 'h', 4: 'i'}.get(sample_width, 'h')
+        sample_count = len(frames) // sample_width
+        samples = struct.unpack(f'<{sample_count}{fmt}', frames)
+        return int(np.sqrt(np.mean(np.array(samples, dtype=np.float64) ** 2)))
     GUIDE_TRANSCRIPTION_MIN_SPLIT_BEATS = 8.0
     GUIDE_TRANSCRIPTION_MEASURE_ALIGNMENT_TOLERANCE_BEATS = 1.0
     GUIDE_TRANSCRIPTION_MICRO_FRAGMENT_MEASURES = 0.75
@@ -2572,7 +2583,7 @@ class AbletonService:
                     frames = wav_file.readframes(window_frames)
                     if not frames:
                         break
-                    rms_values.append(audioop.rms(frames, sample_width))
+                    rms_values.append(self._calculate_rms(frames, sample_width))
         except Exception as exc:
             logger.warning(f"Failed to analyze guide cues for '{guide_wav.filename}': {exc}")
             self.guide_cue_cache[cache_key] = []
