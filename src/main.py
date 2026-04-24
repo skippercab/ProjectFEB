@@ -22,7 +22,12 @@ def main():
 
     # Create and run the application
     app = ProjectFEBApp(config)
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.shutdown()
 
 if __name__ == "__main__":
     main()

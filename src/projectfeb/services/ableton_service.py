@@ -1,15 +1,17 @@
 """Ableton Live project file generation and manipulation service."""
 
 import gzip
+import gc
 import json
 import subprocess
+import threading
 import zipfile
 import wave
 import audioop
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass
 from collections import defaultdict
 from loguru import logger
@@ -44,6 +46,8 @@ class GenerationCancelledError(Exception):
 class AbletonService:
     """Service for working with Ableton Live project files."""
 
+    TIME_SIGNATURE_FOUR_FOUR_VALUE = '201'
+    TIME_SIGNATURE_SIX_EIGHT_VALUE = '302'
     KEY_OPTION_ORDER = ('AB', 'A', 'BB', 'B', 'C', 'DB', 'D', 'EB', 'E', 'F', 'GB', 'G')
     GUIDE_CUE_WINDOW_SECONDS = 0.03
     GUIDE_CUE_MIN_ACTIVE_SECONDS = 0.18
@@ -55,6 +59,12 @@ class AbletonService:
     GUIDE_TRANSCRIPTION_MODEL = 'base.en'
     GUIDE_TRANSCRIPTION_EXACT_MATCH_SCORE = 3
     GUIDE_TRANSCRIPTION_WEAK_MATCH_SCORE = 1
+    GUIDE_TRANSCRIPTION_STRUCTURAL_MATCH_BONUS = 2
+    GUIDE_TRANSCRIPTION_CLOSE_MATCH_RATIO = 0.03
+    GUIDE_TRANSCRIPTION_GUIDE_NATIVE_MARGIN = 6
+    GUIDE_TRANSCRIPTION_MIN_SPLIT_BEATS = 8.0
+    GUIDE_TRANSCRIPTION_MEASURE_ALIGNMENT_TOLERANCE_BEATS = 1.0
+    GUIDE_TRANSCRIPTION_MICRO_FRAGMENT_MEASURES = 0.75
     GUIDE_TRANSCRIPTION_MIN_MATCH_RATIO = 0.55
     GUIDE_TRANSCRIPTION_DUPLICATE_GAP_SECONDS = 4.0
     GUIDE_TRANSCRIPTION_GUIDE_NATIVE_EXTRA_SECTIONS = 2
@@ -203,10 +213,15 @@ class AbletonService:
         self.output_folder = Path(config.output_folder) if config.output_folder else Path.home() / "Desktop"
         self.template_format = None  # Will be set to 'zip' or 'gzip' when loading template
         self.template_midi_clip = None  # Template MidiClip to use as base for copies
+        self.template_six_eight_midi_clip = None  # Template 6/8 MidiClip to duplicate for meter changes
         self.blank_audio_track_template = create_blank_audio_track_template()
         self.blank_return_track_template = create_blank_return_track_template()
         self.audio_clip_template = create_audio_clip_template()
         self.source_key_cache: Dict[str, Optional[str]] = {}
+        self.song_bpm_cache: Dict[str, float] = {}
+        self.target_key_cache: Dict[str, Optional[str]] = {}
+        self.ui_thread_dispatcher: Optional[Callable[[Callable[[], Any]], Any]] = None
+        self.status_reporter: Optional[Callable[[str], None]] = None
         self.guide_cue_cache: Dict[str, List[float]] = {}
         self.guide_transcription_cache: Dict[str, List[Dict[str, Any]]] = {}
         self.guide_transcription_model = None
@@ -228,6 +243,39 @@ class AbletonService:
             logger.warning(f"Invalid output bus layout in config, using defaults: {exc}")
             return self.validate_output_buses(default_output_buses())
 
+    def _run_on_ui_thread(self, callback: Callable[[], Any]) -> Any:
+        """Run a callback on the UI thread when generation is happening in a worker thread."""
+        if self.ui_thread_dispatcher is not None and threading.current_thread() is not threading.main_thread():
+            return self.ui_thread_dispatcher(callback)
+        return callback()
+
+    def _report_status(self, message: str) -> None:
+        """Send a concise progress update to the UI when a reporter is configured."""
+        if self.status_reporter is None:
+            return
+
+        self._run_on_ui_thread(lambda: self.status_reporter(message))
+
+    def shutdown(self) -> None:
+        """Release heavyweight model resources before interpreter shutdown."""
+        model_wrapper = self.guide_transcription_model
+        self.guide_transcription_model = None
+        self.status_reporter = None
+
+        if model_wrapper is None:
+            return
+
+        backend_model = getattr(model_wrapper, 'model', None)
+        unload_model = getattr(backend_model, 'unload_model', None)
+        if callable(unload_model):
+            try:
+                unload_model(False)
+            except Exception as exc:
+                logger.debug(f"Failed to unload guide transcription backend cleanly: {exc}")
+
+        del model_wrapper
+        gc.collect()
+
     def generate_setlist(self, service_type_name: str, service_date, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> Optional[Path]:
         """Generate an Ableton Live setlist from stem matches.
 
@@ -245,6 +293,12 @@ class AbletonService:
             return None
 
         try:
+            self.song_bpm_cache = {}
+            self.target_key_cache = {}
+            song_count = len(plan_songs or [])
+
+            self._report_status("Preparing Ableton template...")
+
             # Load and parse the template
             template_tree = self._load_template()
             if not template_tree:
@@ -260,9 +314,15 @@ class AbletonService:
             als_file_path = self._generate_output_path(service_type_name, service_date)
 
             # Modify the template with service data
+            if song_count:
+                self._report_status(f"Building setlist for {song_count} songs...")
+            else:
+                self._report_status("Building setlist structure...")
             self._populate_setlist(template_tree, project_title, stem_matches, plan_songs, als_file_path)
 
+            self._report_status("Saving Ableton setlist...")
             self._save_project(template_tree, als_file_path)
+            self._report_status("Setlist ready.")
 
             logger.info(f"Generated setlist: {als_file_path}")
             return als_file_path
@@ -334,39 +394,45 @@ class AbletonService:
             return None
 
     def _extract_template_midi_clip(self, root: ET.Element) -> None:
-        """Extract a working template MidiClip (INTRO) to use as a base for copies.
+        """Extract reusable template MidiClips from the source template.
         
-        The INTRO clip is known to render properly in Ableton, so we duplicate
-        its exact structure when creating new clips. This ensures new clips have
-        all the necessary fields for Ableton to display them.
+        The INTRO clip is used as the base for section clips, and the parked 6/8
+        clip is reused for songs that need a meter change overlay.
         """
+        self.template_midi_clip = None
+        self.template_six_eight_midi_clip = None
+
         try:
+            fallback_clip = None
+
             # Find the INTRO MidiClip in ArrangerAutomation/Events
-            # This is a known working clip that displays properly in Ableton
             for midi_track in root.findall('.//MidiTrack'):
                 clip_timeable = midi_track.find('.//ClipTimeable')
                 if clip_timeable is not None:
                     events = clip_timeable.find('.//ArrangerAutomation/Events')
                     if events is not None:
-                        # Look for the INTRO clip specifically (it's known to work)
                         for midi_clip in events.findall('MidiClip'):
+                            if fallback_clip is None:
+                                fallback_clip = midi_clip
+
                             name_elem = midi_clip.find('Name')
                             if name_elem is not None:
                                 clip_name = name_elem.get('Value', '')
                                 if clip_name == 'INTRO':
-                                    # Store a deep copy of this working clip
                                     self.template_midi_clip = copy.deepcopy(midi_clip)
                                     logger.info(f"Extracted working template INTRO MidiClip: Id={midi_clip.get('Id')}")
-                                    return
-                        
-                        # Fallback: if no INTRO found, use first clip
-                        midi_clip = events.find('MidiClip')
-                        if midi_clip is not None:
-                            name_elem = midi_clip.find('Name')
-                            clip_name = name_elem.get('Value', 'unknown') if name_elem is not None else 'unknown'
-                            self.template_midi_clip = copy.deepcopy(midi_clip)
-                            logger.info(f"Extracted template MidiClip (fallback): Id={midi_clip.get('Id')}, Name={clip_name}")
-                            return
+
+                                if clip_name == '6/8':
+                                    self.template_six_eight_midi_clip = copy.deepcopy(midi_clip)
+                                    logger.info(f"Extracted template 6/8 MidiClip: Id={midi_clip.get('Id')}")
+
+            if self.template_midi_clip is None and fallback_clip is not None:
+                name_elem = fallback_clip.find('Name')
+                clip_name = name_elem.get('Value', 'unknown') if name_elem is not None else 'unknown'
+                self.template_midi_clip = copy.deepcopy(fallback_clip)
+                logger.info(
+                    f"Extracted template MidiClip (fallback): Id={fallback_clip.get('Id')}, Name={clip_name}"
+                )
         except Exception as e:
             logger.warning(f"Failed to extract template MidiClip: {e}")
 
@@ -418,6 +484,7 @@ class AbletonService:
             self._add_guides_and_midi_clips(liveset, stem_matches, plan_songs, als_file_path)
             # Add tempo mapping for each song
             self._add_tempo_mapping(liveset, plan_songs)
+            self._add_time_signature_mapping(liveset, plan_songs)
 
     def _prepare_output_buses(self, liveset: ET.Element) -> None:
         """Rebuild return buses from config so generation does not depend on template returns."""
@@ -696,14 +763,16 @@ class AbletonService:
         if midi_track_idx is None:
             logger.warning("Failed to create arrangement track")
 
+        self._remove_named_midi_clips(tracks, '6/8')
+
         for song_idx, song in enumerate(plan_songs):
+            self._report_status(f"Building song {song_idx + 1}/{len(plan_songs)}: {song.title}")
+
             if song.title not in stem_matches:
                 logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/MIDI")
                 continue
 
-            marker_key = f"{song_idx + 1}) {song.title}"
-            if song.key_name:
-                marker_key += f" ({song.key_name})"
+            marker_key = self._song_marker_key(song_idx, song)
 
             if marker_key not in locators_map:
                 logger.warning(f"Marker '{marker_key}' not found in template")
@@ -713,16 +782,29 @@ class AbletonService:
             logger.info(f"Song {song_idx + 1} '{song.title}' starts at beat {song_start_beat}")
 
             stem_match = stem_matches[song.title]
-            bpm = song.arrangement.bpm if song.arrangement and song.arrangement.bpm else 120
+            bpm = self._resolve_song_bpm(song)
             song_color = self._get_song_color_from_click_track(tracks, song_start_beat)
-            song_source_key = self._resolve_song_source_key(song, stem_match.stems) if song.key_name else None
-            song_pitch_shift = self._calculate_song_pitch_shift(song_source_key, song.key_name)
-            if song_source_key is not None and song.key_name:
+            song_source_key = self._resolve_song_source_key(song, stem_match.stems)
+            song_target_key = self._resolve_song_target_key(song, stem_match.stems, song_source_key)
+            song_pitch_shift = self._calculate_song_pitch_shift(song_source_key, song_target_key)
+            if song_source_key is not None and song_target_key is not None:
                 logger.info(
-                    f"Key mapping for '{song.title}': {song_source_key} -> {self._normalize_key_name(song.key_name)} ({song_pitch_shift:+d} st)"
+                    f"Key mapping for '{song.title}': {song_source_key} -> {song_target_key} ({song_pitch_shift:+d} st)"
                 )
 
             primary_guide_wav = self._select_primary_guide_wav(stem_match.stems)
+            if self._is_six_eight_meter(song.arrangement.meter if song.arrangement else None):
+                self._add_meter_signature_clip_for_song(
+                    tracks,
+                    plan_songs,
+                    locators_map,
+                    song_idx,
+                    song,
+                    song_start_beat,
+                    primary_guide_wav,
+                    bpm,
+                )
+
             if primary_guide_wav and als_file_path is not None:
                 logger.info(f"Adding guide wav for '{song.title}' at beat {song_start_beat}: {primary_guide_wav.filename}")
                 if shared_guide_audio_track is None:
@@ -829,12 +911,9 @@ class AbletonService:
             # Collect all BPM values from songs
             song_bpms = []
             for song_idx, song in enumerate(plan_songs):
-                if not song.arrangement or not song.arrangement.bpm:
-                    logger.warning(f"Song '{song.title}' has no arrangement BPM")
-                    song_bpms.append(120)  # Default to 120
-                else:
-                    song_bpms.append(song.arrangement.bpm)
-                    logger.info(f"Song {song_idx + 1} '{song.title}' BPM: {song.arrangement.bpm}")
+                resolved_bpm = self._resolve_song_bpm(song)
+                song_bpms.append(resolved_bpm)
+                logger.info(f"Song {song_idx + 1} '{song.title}' BPM: {resolved_bpm}")
             
             # Create new tempo events for each song
             # Start with initial BPM at very early time
@@ -885,6 +964,87 @@ class AbletonService:
         except Exception as e:
             logger.error(f"Failed to add tempo mapping: {e}")
 
+    def _time_signature_value_for_meter(self, meter: Optional[str]) -> str:
+        """Map supported song meters to Ableton master-envelope enum values."""
+        if self._is_six_eight_meter(meter):
+            return self.TIME_SIGNATURE_SIX_EIGHT_VALUE
+        return self.TIME_SIGNATURE_FOUR_FOUR_VALUE
+
+    def _add_time_signature_mapping(self, liveset: ET.Element, plan_songs: List) -> None:
+        """Add master time-signature automation events so the top ruler matches song meters."""
+        try:
+            locators_map = self._get_locators_map(liveset)
+
+            master_track = liveset.find('.//MasterTrack')
+            if master_track is None:
+                logger.warning('No MasterTrack found, skipping time-signature mapping')
+                return
+
+            auto_envelopes = master_track.find('.//AutomationEnvelopes')
+            if auto_envelopes is None:
+                logger.warning('No AutomationEnvelopes found in MasterTrack')
+                return
+
+            envelopes_container = auto_envelopes.find('Envelopes')
+            if envelopes_container is None:
+                logger.warning('No Envelopes container found in AutomationEnvelopes')
+                return
+
+            time_signature_envelope = None
+            for envelope in envelopes_container.findall('AutomationEnvelope'):
+                target = envelope.find('EnvelopeTarget/PointeeId')
+                if target is not None and target.get('Value') == '10':
+                    time_signature_envelope = envelope
+                    break
+
+            if time_signature_envelope is None:
+                logger.warning('Time-signature automation envelope not found, skipping meter mapping')
+                return
+
+            automation = time_signature_envelope.find('Automation')
+            if automation is None:
+                logger.warning('No Automation element in time-signature envelope')
+                return
+
+            events = automation.find('Events')
+            if events is None:
+                logger.warning('No Events element in time-signature automation')
+                return
+
+            for event in list(events.findall('EnumEvent')):
+                events.remove(event)
+
+            initial_meter = plan_songs[0].arrangement.meter if plan_songs and plan_songs[0].arrangement else None
+            initial_event = ET.Element('EnumEvent')
+            initial_event.set('Id', '0')
+            initial_event.set('Time', '-63072000')
+            initial_event.set('Value', self._time_signature_value_for_meter(initial_meter))
+            events.append(initial_event)
+
+            event_id = 1
+            for song_idx in range(1, len(plan_songs)):
+                song = plan_songs[song_idx]
+                marker_key = self._song_marker_key(song_idx, song)
+                song_start_beat = locators_map.get(marker_key)
+                if song_start_beat is None:
+                    logger.warning(f"Marker '{marker_key}' not found, skipping time-signature event")
+                    continue
+
+                meter = song.arrangement.meter if song.arrangement else None
+                event = ET.Element('EnumEvent')
+                event.set('Id', str(event_id))
+                event.set('Time', self._format_beat_value(song_start_beat))
+                event.set('Value', self._time_signature_value_for_meter(meter))
+                events.append(event)
+                event_id += 1
+
+                logger.info(
+                    f"Added time-signature event at beat {song_start_beat}: {meter or '4/4'} for '{song.title}'"
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to add time-signature mapping: {e}")
+
     def _get_locators_map(self, liveset: ET.Element) -> Dict[str, float]:
         """Extract marker names and their beat positions from locators."""
         locators_map = {}
@@ -910,6 +1070,224 @@ class AbletonService:
                     pass
         
         return locators_map
+
+    def _song_marker_key(self, song_idx: int, song) -> str:
+        """Build the locator name used for a song marker in the template."""
+        marker_key = f"{song_idx + 1}) {song.title}"
+        if song.key_name:
+            marker_key += f" ({song.key_name})"
+        return marker_key
+
+    def _is_six_eight_meter(self, meter: Optional[str]) -> bool:
+        """Return True when the arrangement meter is explicitly 6/8."""
+        if meter is None:
+            return False
+        return meter.replace(' ', '') == '6/8'
+
+    def _remove_named_midi_clips(self, tracks: ET.Element, clip_name: str) -> None:
+        """Remove template placeholder MIDI clips by name before adding generated copies."""
+        for midi_track in tracks.findall('MidiTrack'):
+            events = midi_track.find('./DeviceChain/MainSequencer/ClipTimeable/ArrangerAutomation/Events')
+            if events is None:
+                continue
+
+            for midi_clip in list(events.findall('MidiClip')):
+                name_elem = midi_clip.find('Name')
+                if name_elem is not None and name_elem.get('Value', '') == clip_name:
+                    events.remove(midi_clip)
+
+    def _get_track_arranger_events(self, track: ET.Element) -> Optional[ET.Element]:
+        """Return the ArrangerAutomation Events container for a MIDI track."""
+        clip_timeable = track.find('./DeviceChain/MainSequencer/ClipTimeable')
+        if clip_timeable is None:
+            return None
+
+        arranger_automation = clip_timeable.find('ArrangerAutomation')
+        if arranger_automation is None:
+            arranger_automation = ET.SubElement(clip_timeable, 'ArrangerAutomation')
+
+        events = arranger_automation.find('Events')
+        if events is None:
+            events = ET.SubElement(arranger_automation, 'Events')
+
+        return events
+
+    def _next_midi_clip_id(self, events: ET.Element) -> int:
+        """Return the next available MIDI clip Id for an Events container."""
+        max_id = 0
+        for clip in events.findall('MidiClip'):
+            try:
+                max_id = max(max_id, int(clip.get('Id', '0')))
+            except ValueError:
+                continue
+        return max_id + 1
+
+    def _get_midi_clip_start_beat(self, clip: ET.Element) -> Optional[float]:
+        """Read a MIDI clip start beat from either the Time attribute or CurrentStart."""
+        clip_time = clip.get('Time')
+        if clip_time is not None:
+            try:
+                return float(clip_time)
+            except ValueError:
+                pass
+
+        current_start = clip.find('CurrentStart')
+        if current_start is not None:
+            current_start_value = current_start.get('Value')
+            if current_start_value is not None:
+                try:
+                    return float(current_start_value)
+                except ValueError:
+                    pass
+
+        return None
+
+    def _get_midi_clip_end_beat(self, clip: ET.Element) -> Optional[float]:
+        """Read a MIDI clip end beat from CurrentEnd when present."""
+        current_end = clip.find('CurrentEnd')
+        if current_end is None:
+            return None
+
+        current_end_value = current_end.get('Value')
+        if current_end_value is None:
+            return None
+
+        try:
+            return float(current_end_value)
+        except ValueError:
+            return None
+
+    def _get_existing_meter_clip_end_beat(self, events: ET.Element, beat_position: float) -> Optional[float]:
+        """Reuse the template click clip span already present at this beat when available."""
+        for clip in events.findall('MidiClip'):
+            clip_start = self._get_midi_clip_start_beat(clip)
+            if clip_start is None or abs(clip_start - beat_position) > 0.001:
+                continue
+
+            clip_end = self._get_midi_clip_end_beat(clip)
+            if clip_end is not None and clip_end > beat_position:
+                return clip_end
+
+        return None
+
+    def _remove_meter_clips_at_beat(self, events: ET.Element, clip_names: set[str], beat_position: float) -> None:
+        """Remove time-signature clips with matching names that start at the given beat."""
+        for clip in list(events.findall('MidiClip')):
+            name_elem = clip.find('Name')
+            clip_name = name_elem.get('Value', '') if name_elem is not None else ''
+            if clip_name not in clip_names:
+                continue
+
+            clip_start = self._get_midi_clip_start_beat(clip)
+            if clip_start is None:
+                continue
+
+            if abs(clip_start - beat_position) <= 0.001:
+                events.remove(clip)
+
+    def _insert_midi_clip_in_time_order(self, events: ET.Element, midi_clip: ET.Element) -> None:
+        """Insert a MIDI clip before the first later clip so event order stays chronological."""
+        new_start = self._get_midi_clip_start_beat(midi_clip)
+        if new_start is None:
+            events.append(midi_clip)
+            return
+
+        for index, existing_clip in enumerate(events.findall('MidiClip')):
+            existing_start = self._get_midi_clip_start_beat(existing_clip)
+            if existing_start is None:
+                continue
+            if existing_start > new_start:
+                events.insert(index, midi_clip)
+                return
+
+        events.append(midi_clip)
+
+    def _resolve_song_end_beat(
+        self,
+        plan_songs: List,
+        locators_map: Dict[str, float],
+        song_idx: int,
+        song,
+        song_start_beat: float,
+        guide_wav: Optional[AudioStem],
+        bpm: float,
+    ) -> float:
+        """Estimate the end beat for a song so meter clips can span the full song."""
+        if song_idx + 1 < len(plan_songs):
+            next_marker_key = self._song_marker_key(song_idx + 1, plan_songs[song_idx + 1])
+            next_song_start = locators_map.get(next_marker_key)
+            if next_song_start is not None and next_song_start > song_start_beat:
+                return next_song_start
+
+        if guide_wav is not None and bpm > 0:
+            _, _, duration_seconds = self._get_wav_metadata(guide_wav.path)
+            if duration_seconds > 0:
+                return song_start_beat + ((duration_seconds * bpm) / 60.0)
+
+        return song_start_beat + 240.0
+
+    def _add_meter_signature_clip_for_song(
+        self,
+        tracks: ET.Element,
+        plan_songs: List,
+        locators_map: Dict[str, float],
+        song_idx: int,
+        song,
+        song_start_beat: float,
+        guide_wav: Optional[AudioStem],
+        bpm: float,
+    ) -> None:
+        """Duplicate the template 6/8 clip across the full span of 6/8 songs."""
+        if self.template_six_eight_midi_clip is None:
+            logger.warning("Template 6/8 MidiClip not found; skipping meter overlay clip")
+            return
+
+        meter_track_idx = self._find_midi_track_by_name(tracks, 'click')
+        if meter_track_idx is None:
+            logger.warning("MIDI click track not found; skipping 6/8 meter clip")
+            return
+
+        midi_tracks = tracks.findall('.//MidiTrack')
+        if meter_track_idx >= len(midi_tracks):
+            logger.warning("MIDI click track index out of range; skipping 6/8 meter clip")
+            return
+
+        events = self._get_track_arranger_events(midi_tracks[meter_track_idx])
+        if events is None:
+            logger.warning("Could not locate ArrangerAutomation events on MIDI click track")
+            return
+
+        existing_clip_end_beat = self._get_existing_meter_clip_end_beat(events, song_start_beat)
+        self._remove_meter_clips_at_beat(events, {'4/4', '6/8'}, song_start_beat)
+
+        song_end_beat = existing_clip_end_beat
+        if song_end_beat is None:
+            song_end_beat = self._resolve_song_end_beat(
+                plan_songs,
+                locators_map,
+                song_idx,
+                song,
+                song_start_beat,
+                guide_wav,
+                bpm,
+            )
+        clip_duration = max(1.0, song_end_beat - song_start_beat)
+        clip_id = self._next_midi_clip_id(events)
+        meter_clip = self._create_midi_clip_from_template(
+            template_clip=self.template_six_eight_midi_clip,
+            name='6/8',
+            beat_position=song_start_beat,
+            duration=clip_duration,
+            clip_id=clip_id,
+            preserve_loop_values=True,
+        )
+        if meter_clip is None:
+            return
+
+        self._insert_midi_clip_in_time_order(events, meter_clip)
+        logger.info(
+            f"Added 6/8 meter clip for '{song.title}' from beat {song_start_beat:.2f} to {song_end_beat:.2f}"
+        )
 
     def _find_track_by_name(self, tracks: ET.Element, search_name: str) -> Optional[int]:
         """Find audio track index by name, returns None if not found."""
@@ -1245,6 +1623,38 @@ class AbletonService:
             return stem_name
         return f"{song_title} - {stem_name}"
 
+    def _audio_stem_sort_label(self, stem: AudioStem) -> str:
+        """Return the stem label used to order generated tracks inside a group."""
+        stem_name = stem.path.stem
+        song_title = (stem.song_title or '').strip()
+        if ' - ' in stem_name:
+            parts = [part.strip() for part in stem_name.split(' - ') if part.strip()]
+            for part in parts:
+                if song_title and song_title.lower() in part.lower():
+                    continue
+                return part
+
+        if song_title:
+            stem_name = re.sub(re.escape(song_title), ' ', stem_name, flags=re.IGNORECASE)
+
+        stem_name = re.sub(r'^[\s\-_]+|[\s\-_]+$', '', stem_name)
+        stem_name = re.sub(r'\s+', ' ', stem_name).strip()
+        return stem_name or stem.path.stem
+
+    def _audio_stem_sort_key(self, stem: AudioStem) -> tuple:
+        """Natural sort key for generated audio track order inside a group."""
+        label = self._audio_stem_sort_label(stem).lower()
+        parts = re.split(r'(\d+)', label)
+        key_parts: List[tuple[int, Any]] = []
+        for part in parts:
+            if not part:
+                continue
+            if part.isdigit():
+                key_parts.append((1, int(part)))
+                continue
+            key_parts.append((0, part))
+        return tuple(key_parts)
+
     def _special_bus_send_indexes(self, role: str) -> List[int]:
         """Return the generated send indexes for a non-content bus role."""
         send_indexes: List[int] = []
@@ -1438,6 +1848,162 @@ class AbletonService:
             return None
         return self.KEY_DISPLAY_NAMES.get(normalized, normalized)
 
+    def _song_prompt_cache_key(self, song) -> str:
+        """Return a stable cache key for per-song generation prompts."""
+        return str(getattr(song, 'item_id', None) or getattr(song, 'id', None) or song.title)
+
+    def _prompt_for_song_bpm(self, song_title: str, initial_bpm: float = 120.0) -> float:
+        """Ask the user for a BPM when Planning Center did not provide one."""
+        selected_bpm: Dict[str, Optional[float]] = {'value': None}
+
+        try:
+            root = tk._get_temp_root()
+            dialog = tk.Toplevel(root)
+            dialog.title("Resolve Song BPM")
+            dialog.resizable(False, False)
+            dialog.transient(root)
+            dialog.grab_set()
+
+            prompt = (
+                f"Planning Center did not provide a BPM for '{song_title}'.\n\n"
+                "Enter the BPM to use for audio placement and tempo automation."
+            )
+            message = tk.Label(dialog, text=prompt, justify='left', anchor='w', wraplength=420)
+            message.pack(padx=16, pady=(16, 12), fill='both')
+
+            display_bpm = int(initial_bpm) if float(initial_bpm).is_integer() else initial_bpm
+            selected_value = tk.StringVar(value=str(display_bpm))
+            entry = ttk.Entry(dialog, textvariable=selected_value, width=16)
+            entry.pack(padx=16, pady=(0, 16), fill='x')
+            entry.focus_set()
+            entry.selection_range(0, 'end')
+
+            button_row = tk.Frame(dialog)
+            button_row.pack(padx=16, pady=(0, 16), fill='x')
+
+            def confirm() -> None:
+                try:
+                    bpm_value = float(selected_value.get().strip())
+                except ValueError:
+                    messagebox.showwarning("Resolve Song BPM", "Enter a valid BPM number.", parent=dialog)
+                    return
+
+                if bpm_value <= 0:
+                    messagebox.showwarning("Resolve Song BPM", "BPM must be greater than 0.", parent=dialog)
+                    return
+
+                selected_bpm['value'] = bpm_value
+                dialog.destroy()
+
+            def cancel() -> None:
+                dialog.destroy()
+
+            ttk.Button(button_row, text='OK', command=confirm).pack(side='right')
+            ttk.Button(button_row, text='Cancel', command=cancel).pack(side='right', padx=(0, 8))
+
+            dialog.protocol('WM_DELETE_WINDOW', cancel)
+            dialog.bind('<Return>', lambda event: confirm())
+            dialog.bind('<Escape>', lambda event: cancel())
+            dialog.wait_window()
+        except Exception as exc:
+            logger.warning(f"Unable to prompt for BPM for '{song_title}': {exc}")
+            return initial_bpm
+
+        if selected_bpm['value'] is None:
+            raise GenerationCancelledError(f"BPM selection cancelled for '{song_title}'")
+
+        return selected_bpm['value']
+
+    def _resolve_song_bpm(self, song) -> float:
+        """Resolve a song BPM from PCO metadata or a one-time user prompt."""
+        cache_key = self._song_prompt_cache_key(song)
+        if cache_key in self.song_bpm_cache:
+            return self.song_bpm_cache[cache_key]
+
+        arrangement = getattr(song, 'arrangement', None)
+        if arrangement and arrangement.bpm:
+            bpm_value = float(arrangement.bpm)
+        else:
+            logger.warning(f"Song '{song.title}' has no arrangement BPM")
+            bpm_value = self._run_on_ui_thread(lambda: self._prompt_for_song_bpm(song.title))
+
+        self.song_bpm_cache[cache_key] = bpm_value
+        return bpm_value
+
+    def _prompt_for_song_target_key(self, song_title: str, stems: List[AudioStem], preferred_key: Optional[str]) -> Optional[str]:
+        """Ask the user for the target key when Planning Center did not provide one."""
+        sample_names = ', '.join(sorted({stem.path.parent.name for stem in stems})[:3])
+        prompt = (
+            f"Planning Center did not provide a target key for '{song_title}'.\n\n"
+            f"Stem folders: {sample_names or 'n/a'}\n\n"
+            "Choose the target key to use for pitch correction."
+        )
+
+        selected_key: Dict[str, Optional[str]] = {'value': None}
+        options = [self.KEY_DISPLAY_NAMES[key] for key in self.KEY_OPTION_ORDER]
+
+        preferred_normalized = self._normalize_key_name(preferred_key)
+        if preferred_normalized is None:
+            preferred_normalized = self.KEY_OPTION_ORDER[0]
+
+        try:
+            root = tk._get_temp_root()
+            dialog = tk.Toplevel(root)
+            dialog.title("Resolve Song Key")
+            dialog.resizable(False, False)
+            dialog.transient(root)
+            dialog.grab_set()
+
+            message = tk.Label(dialog, text=prompt, justify='left', anchor='w', wraplength=420)
+            message.pack(padx=16, pady=(16, 12), fill='both')
+
+            selected_value = tk.StringVar(value=self.KEY_DISPLAY_NAMES[preferred_normalized])
+            combo = ttk.Combobox(dialog, textvariable=selected_value, values=options, state='readonly', width=12)
+            combo.pack(padx=16, pady=(0, 16), fill='x')
+            combo.focus_set()
+
+            button_row = tk.Frame(dialog)
+            button_row.pack(padx=16, pady=(0, 16), fill='x')
+
+            def confirm() -> None:
+                selected_key['value'] = self._normalize_key_name(selected_value.get())
+                dialog.destroy()
+
+            def cancel() -> None:
+                dialog.destroy()
+
+            ttk.Button(button_row, text='OK', command=confirm).pack(side='right')
+            ttk.Button(button_row, text='Cancel', command=cancel).pack(side='right', padx=(0, 8))
+
+            dialog.protocol('WM_DELETE_WINDOW', cancel)
+            dialog.bind('<Return>', lambda event: confirm())
+            dialog.bind('<Escape>', lambda event: cancel())
+            dialog.wait_window()
+        except Exception as exc:
+            logger.warning(f"Unable to prompt for target key for '{song_title}': {exc}")
+            return None
+
+        if selected_key['value'] is None:
+            raise GenerationCancelledError(f"Target key selection cancelled for '{song_title}'")
+
+        return selected_key['value']
+
+    def _resolve_song_target_key(self, song, stems: List[AudioStem], preferred_key: Optional[str] = None) -> Optional[str]:
+        """Resolve a song target key from PCO metadata or a one-time user prompt."""
+        if song.key_name:
+            return self._normalize_key_name(song.key_name)
+
+        cache_key = self._song_prompt_cache_key(song)
+        if cache_key in self.target_key_cache:
+            return self.target_key_cache[cache_key]
+
+        logger.warning(f"Song '{song.title}' has no Planning Center key")
+        resolved_key = self._run_on_ui_thread(
+            lambda: self._prompt_for_song_target_key(song.title, stems, preferred_key)
+        )
+        self.target_key_cache[cache_key] = resolved_key
+        return resolved_key
+
     def _prompt_for_song_source_key(self, song_title: str, plan_key: Optional[str], stems: List[AudioStem], candidates: List[str]) -> Optional[str]:
         """Ask the user for the source key when filenames/folders are ambiguous."""
         sample_names = ', '.join(sorted({stem.path.parent.name for stem in stems})[:3])
@@ -1518,10 +2084,14 @@ class AbletonService:
             resolved_key = candidates[0]
         elif len(candidates) > 1:
             logger.warning(f"Multiple source keys detected for '{song.title}': {candidates}")
-            resolved_key = self._prompt_for_song_source_key(song.title, song.key_name, stems, candidates)
+            resolved_key = self._run_on_ui_thread(
+                lambda: self._prompt_for_song_source_key(song.title, song.key_name, stems, candidates)
+            )
         else:
             logger.warning(f"No source key detected for '{song.title}'")
-            resolved_key = self._prompt_for_song_source_key(song.title, song.key_name, stems, candidates)
+            resolved_key = self._run_on_ui_thread(
+                lambda: self._prompt_for_song_source_key(song.title, song.key_name, stems, candidates)
+            )
 
         self.source_key_cache[song.title] = resolved_key
         if resolved_key is not None:
@@ -1567,11 +2137,14 @@ class AbletonService:
         return f"{song_title} - {group_name} Placeholder"
 
     def _group_song_audio_wavs(self, stems: List[AudioStem]) -> Dict[str, List[AudioStem]]:
-        """Group routable song WAVs by stem type while preserving discovery order."""
+        """Group routable song WAVs by stem type using stable natural stem ordering."""
         grouped_stems: Dict[str, List[AudioStem]] = {}
 
         for stem in stems:
             grouped_stems.setdefault(stem.stem_type, []).append(stem)
+
+        for stem_type, stems_for_type in grouped_stems.items():
+            grouped_stems[stem_type] = sorted(stems_for_type, key=self._audio_stem_sort_key)
 
         return grouped_stems
 
@@ -1588,7 +2161,7 @@ class AbletonService:
         pitch_shift: int,
     ) -> None:
         """Fallback path when no GroupTrack template exists in the source set."""
-        for audio_stem in audio_stems:
+        for audio_stem in sorted(audio_stems, key=self._audio_stem_sort_key):
             logger.info(
                 f"Adding {audio_stem.stem_type} wav for '{song_title}' at beat {beat_position}: {audio_stem.filename}"
             )
@@ -2109,6 +2682,8 @@ class AbletonService:
     def _guide_cue_family(self, cue_name: str) -> str:
         """Reduce a spoken guide cue or section label to its canonical family."""
         lower_name = cue_name.lower().strip()
+        if 'tag' in lower_name or 'refrain' in lower_name:
+            return 'tag'
         if lower_name.startswith('bridge'):
             return 'bridge'
         if 'pre chorus' in lower_name or 'prechorus' in lower_name:
@@ -2123,7 +2698,7 @@ class AbletonService:
             return 'instrumental'
         if lower_name in {'ending', 'outro', 'end', 'big ending'} or 'ending' in lower_name or 'outro' in lower_name:
             return 'ending'
-        if lower_name in {'tag', 'refrain', 'vamp'}:
+        if lower_name in {'vamp'}:
             return 'tag'
         if 'chorus' in lower_name:
             return 'chorus'
@@ -2446,6 +3021,56 @@ class AbletonService:
 
         return 0
 
+    def _guide_transcription_structural_bonus(self, target_name: str, observed_label: str) -> int:
+        """Reward structurally important matches that should outrank extra generic choruses."""
+        target_family = self._section_family_from_name(target_name)
+        observed_family = self._section_family_from_name(observed_label)
+        if target_family != observed_family:
+            return 0
+
+        normalized_target = target_name.lower().strip()
+        normalized_observed = observed_label.lower().strip()
+
+        if target_family in {'tag', 'ending'}:
+            return self.GUIDE_TRANSCRIPTION_STRUCTURAL_MATCH_BONUS
+
+        if normalized_target.startswith('bridge ') and normalized_target == normalized_observed:
+            return self.GUIDE_TRANSCRIPTION_STRUCTURAL_MATCH_BONUS
+
+        return 0
+
+    def _should_prefer_guide_native_tail(
+        self,
+        sequence: List[str],
+        whole_file_sections: List[Dict[str, Any]],
+        aligned_sections: List[Dict[str, Any]],
+    ) -> bool:
+        """Prefer the richer whole-file guide when it preserves an explicit ending tail the aligned path loses."""
+        if not sequence or len(whole_file_sections) <= len(sequence):
+            return False
+
+        if self._section_family_from_name(sequence[-1]) != 'tag':
+            return False
+
+        if not whole_file_sections:
+            return False
+
+        whole_tail = whole_file_sections[-3:]
+        whole_tail_families = [self._section_family_from_name(section['label']) for section in whole_tail]
+        if not whole_tail_families or whole_tail_families[-1] != 'ending':
+            return False
+
+        whole_tail_labels = [(section.get('label') or '').lower().strip() for section in whole_tail]
+        if 'vamp' not in whole_tail_labels:
+            return False
+
+        if aligned_sections:
+            aligned_tail_families = [self._section_family_from_name(section['target_name']) for section in aligned_sections[-3:]]
+            if aligned_tail_families and aligned_tail_families[-1] == 'ending':
+                return False
+
+        return True
+
     def _normalize_guide_transcribed_sections(
         self,
         sections: List[Dict[str, Any]],
@@ -2584,6 +3209,11 @@ class AbletonService:
                     target_families[target_index - 1],
                     observed_families[observed_index - 1],
                 )
+                if match_score > 0:
+                    match_score += self._guide_transcription_structural_bonus(
+                        sequence[target_index - 1],
+                        sections[observed_index - 1]['label'],
+                    )
                 if match_score > 0 and target_index == target_count:
                     match_score += self._guide_transcription_terminal_bonus(
                         target_families[target_index - 1],
@@ -2605,6 +3235,7 @@ class AbletonService:
             if move == 'diag':
                 section = dict(sections[observed_index - 1])
                 section['target_name'] = sequence[target_index - 1]
+                section['target_index'] = target_index - 1
                 aligned_sections.append(section)
                 target_index -= 1
                 observed_index -= 1
@@ -2618,6 +3249,109 @@ class AbletonService:
         score_ratio = (scores[target_count][observed_count] / max_score) if max_score else 0.0
         return aligned_sections, score_ratio
 
+    def _expand_aligned_sections_to_full_sequence(
+        self,
+        sequence: List[str],
+        aligned_sections: List[Dict[str, Any]],
+        song_duration_seconds: float,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Fill any unmatched PCO sections between aligned guide cues using weighted interpolation."""
+        if not sequence or not aligned_sections:
+            return None
+
+        indexed_sections = [
+            dict(section)
+            for section in aligned_sections
+            if isinstance(section.get('target_index'), int)
+        ]
+        if not indexed_sections:
+            return None
+
+        indexed_sections.sort(key=lambda section: section['target_index'])
+        starts: List[Optional[float]] = [None] * len(sequence)
+        section_by_index: Dict[int, Dict[str, Any]] = {}
+
+        for section in indexed_sections:
+            target_index = section['target_index']
+            if target_index < 0 or target_index >= len(sequence):
+                continue
+
+            start_seconds = float(section['start_seconds'])
+            starts[target_index] = start_seconds
+            section_by_index[target_index] = section
+
+        aligned_indexes = sorted(section_by_index)
+        if not aligned_indexes:
+            return None
+
+        def target_weight(index: int) -> float:
+            return max(1.0, self._expected_section_duration_profile(sequence[index])[2])
+
+        def fill_leading_gap(end_index: int, end_time: float) -> None:
+            if end_index <= 0:
+                return
+
+            interval = max(0.0, end_time)
+            weights = [target_weight(index) for index in range(0, end_index)]
+            total_weight = sum(weights)
+            if total_weight <= 0:
+                return
+
+            elapsed = 0.0
+            for offset, index in enumerate(range(0, end_index)):
+                starts[index] = interval * elapsed / total_weight
+                elapsed += weights[offset]
+
+        def fill_gap_after_anchor(anchor_index: int, end_index: int, start_time: float, end_time: float) -> None:
+            if end_index <= anchor_index + 1:
+                return
+
+            interval = max(0.0, end_time - start_time)
+            weights = [target_weight(index) for index in range(anchor_index, end_index)]
+            total_weight = sum(weights)
+            if total_weight <= 0:
+                return
+
+            elapsed = weights[0]
+            for offset, index in enumerate(range(anchor_index + 1, end_index), start=1):
+                starts[index] = start_time + (interval * elapsed / total_weight)
+                elapsed += weights[offset]
+
+        first_index = aligned_indexes[0]
+        first_start = starts[first_index]
+        if first_start is None:
+            return None
+        fill_leading_gap(first_index, first_start)
+
+        for previous_index, current_index in zip(aligned_indexes, aligned_indexes[1:]):
+            previous_start = starts[previous_index]
+            current_start = starts[current_index]
+            if previous_start is None or current_start is None:
+                return None
+
+            fill_gap_after_anchor(previous_index, current_index, previous_start, current_start)
+
+        last_index = aligned_indexes[-1]
+        last_start = starts[last_index]
+        if last_start is None:
+            return None
+        fill_gap_after_anchor(last_index, len(sequence), last_start, song_duration_seconds)
+
+        expanded_sections: List[Dict[str, Any]] = []
+        for index, section_name in enumerate(sequence):
+            start_seconds = starts[index]
+            if start_seconds is None:
+                return None
+
+            section = dict(section_by_index.get(index, {}))
+            section['label'] = section.get('label', section_name)
+            section['target_name'] = section_name
+            section['target_index'] = index
+            section['start_seconds'] = start_seconds
+            expanded_sections.append(section)
+
+        return expanded_sections
+
     def _transcribe_guide_sections(self, guide_wav: AudioStem, sequence: List[str]) -> List[Dict[str, Any]]:
         """Choose the best transcription strategy for the guide WAV against the target sequence."""
         phrase_sections = self._transcribe_guide_phrase_sections(guide_wav)
@@ -2626,13 +3360,6 @@ class AbletonService:
                 self._transcribe_guide_whole_file_sections(guide_wav)
             )
         )
-
-        if whole_file_sections:
-            logger.info(
-                f"Using full guide-native transcription for '{guide_wav.filename}' "
-                f"with {len(whole_file_sections)} sections"
-            )
-            return whole_file_sections
 
         candidates = [
             ('phrase', phrase_sections),
@@ -2643,36 +3370,51 @@ class AbletonService:
         best_mode: Optional[str] = None
         best_ratio = 0.0
         best_count = 0
+        best_count_gap: Optional[int] = None
 
         for mode, sections in candidates:
             aligned_sections, score_ratio = self._align_transcribed_sections_to_sequence(sequence, sections)
             if not aligned_sections:
                 continue
 
-            if (
-                score_ratio > best_ratio
-                or (score_ratio == best_ratio and len(aligned_sections) > best_count)
-            ):
+            count_gap = abs(len(sections) - len(sequence))
+
+            ratio_improvement = score_ratio - best_ratio
+            should_replace = False
+
+            if ratio_improvement > self.GUIDE_TRANSCRIPTION_CLOSE_MATCH_RATIO:
+                should_replace = True
+            elif abs(ratio_improvement) <= self.GUIDE_TRANSCRIPTION_CLOSE_MATCH_RATIO:
+                if best_count_gap is None or count_gap < best_count_gap:
+                    should_replace = True
+                elif count_gap == best_count_gap and len(aligned_sections) > best_count:
+                    should_replace = True
+
+            if should_replace:
                 best_sections = aligned_sections
                 best_mode = mode
                 best_ratio = score_ratio
                 best_count = len(aligned_sections)
+                best_count_gap = count_gap
+
+        if self._should_prefer_guide_native_tail(sequence, whole_file_sections, best_sections):
+            logger.info(
+                f"Using guide-native whole-file ending tail for '{guide_wav.filename}' "
+                f"with {len(whole_file_sections)} sections versus {len(sequence)} PCO targets"
+            )
+            return whole_file_sections
+
+        if (
+            len(whole_file_sections) >= len(sequence) + self.GUIDE_TRANSCRIPTION_GUIDE_NATIVE_MARGIN
+            and len(whole_file_sections) > len(phrase_sections)
+        ):
+            logger.info(
+                f"Using guide-native whole-file sections for '{guide_wav.filename}' "
+                f"with {len(whole_file_sections)} sections versus {len(sequence)} PCO targets"
+            )
+            return whole_file_sections
 
         if best_sections and best_ratio >= self.GUIDE_TRANSCRIPTION_MIN_MATCH_RATIO:
-            if best_mode == 'phrase':
-                best_sections = phrase_sections
-            elif (
-                best_mode == 'whole-file'
-                and len(whole_file_sections) > len(best_sections)
-                and len(whole_file_sections) <= len(sequence) + self.GUIDE_TRANSCRIPTION_GUIDE_NATIVE_EXTRA_SECTIONS
-            ):
-                best_sections = whole_file_sections
-                logger.info(
-                    f"Using guide-native whole-file section order for '{guide_wav.filename}' "
-                    f"because the guide contains {len(whole_file_sections)} coherent sections versus "
-                    f"{len(best_sections)} PCO-aligned matches"
-                )
-
             logger.info(
                 f"Using {best_mode} guide transcription for '{guide_wav.filename}' "
                 f"with match ratio {best_ratio:.2f} ({len(best_sections)} returned sections)"
@@ -2685,12 +3427,42 @@ class AbletonService:
         """Reduce a section name to its broad family for numbering reuse."""
         return self._guide_cue_family(section_name)
 
-    def _display_name_for_guide_label(self, label: str, modifiers: Optional[List[str]] = None) -> str:
+    def _beats_per_measure(self, meter: Optional[str]) -> float:
+        """Return the beat count for one bar in the song meter."""
+        return 6.0 if self._is_six_eight_meter(meter) else 4.0
+
+    def _is_close_to_measure_multiple(
+        self,
+        beat_count: float,
+        measure_beats: float,
+        tolerance_beats: Optional[float] = None,
+    ) -> bool:
+        """Return True when a beat count is close to a whole-bar multiple."""
+        if measure_beats <= 0:
+            return False
+
+        tolerance = tolerance_beats if tolerance_beats is not None else min(
+            self.GUIDE_TRANSCRIPTION_MEASURE_ALIGNMENT_TOLERANCE_BEATS,
+            measure_beats / 4.0,
+        )
+        nearest_multiple = round(beat_count / measure_beats) * measure_beats
+        return abs(beat_count - nearest_multiple) <= tolerance
+
+    def _display_name_for_guide_label(
+        self,
+        label: str,
+        modifiers: Optional[List[str]] = None,
+        text: Optional[str] = None,
+    ) -> str:
         """Build a readable fallback display label from a canonical guide label."""
         modifiers = modifiers or []
         family = self._guide_cue_family(label)
+        lower_label = label.lower().strip()
+        lower_text = (text or '').lower()
         if label.startswith('bridge '):
             return label.title()
+        if lower_label == 'vamp':
+            return 'Vamp'
         if family == 'turnaround':
             return 'Turnaround'
         if family == 'pre chorus':
@@ -2706,6 +3478,8 @@ class AbletonService:
                 return 'All In'
             return 'Interlude'
         if family == 'tag':
+            if 'refrain' in lower_text or 'refrain' in lower_label:
+                return 'Refrain'
             return 'Tag'
         if family == 'instrumental':
             return 'Instrumental'
@@ -2726,6 +3500,9 @@ class AbletonService:
         if observed_family == target_family:
             return 3
 
+        if target_family == 'turnaround' and observed_family == 'post chorus':
+            return 2
+
         modifiers = set(section.get('modifiers', []))
         if target_family == 'tag' and observed_family in {'chorus', 'interlude'}:
             if modifiers.intersection({'all in', 'breakdown', 'build', 'drums in'}):
@@ -2741,6 +3518,7 @@ class AbletonService:
         for section in sections:
             label = section['label']
             modifiers = section.get('modifiers', [])
+            text = section.get('text')
 
             if sequence_index < len(sequence):
                 candidate_name = sequence[sequence_index]
@@ -2748,13 +3526,51 @@ class AbletonService:
                     resolved_name = candidate_name
                     sequence_index += 1
                 else:
-                    resolved_name = self._display_name_for_guide_label(label, modifiers)
+                    resolved_name = self._display_name_for_guide_label(label, modifiers, text)
             else:
-                resolved_name = self._display_name_for_guide_label(label, modifiers)
+                resolved_name = self._display_name_for_guide_label(label, modifiers, text)
 
             resolved_names.append(resolved_name)
 
-        return resolved_names
+        family_counts: Dict[str, int] = {}
+        normalized_names: List[str] = []
+        for resolved_name in resolved_names:
+            family = self._section_family_from_name(resolved_name)
+            lower_name = resolved_name.lower().strip()
+
+            if family == 'verse':
+                if lower_name.startswith('verse '):
+                    suffix = lower_name.removeprefix('verse ').strip()
+                    if suffix.isdigit():
+                        family_counts['verse'] = max(family_counts.get('verse', 0), int(suffix))
+                        normalized_names.append(resolved_name)
+                        continue
+                if lower_name == 'verse':
+                    next_index = family_counts.get('verse', 0) + 1
+                    family_counts['verse'] = next_index
+                    normalized_names.append(f'Verse {next_index}')
+                    continue
+
+            if family == 'bridge':
+                if lower_name.startswith('bridge '):
+                    suffix = lower_name.removeprefix('bridge ').strip()
+                    if suffix.isdigit():
+                        bridge_index = int(suffix)
+                        family_counts['bridge'] = max(family_counts.get('bridge', 0), bridge_index)
+                        normalized_names.append('Bridge' if bridge_index == 1 else f'Bridge {bridge_index}')
+                        continue
+                if lower_name == 'bridge':
+                    next_index = family_counts.get('bridge', 0) + 1
+                    family_counts['bridge'] = next_index
+                    normalized_names.append('Bridge' if next_index == 1 else f'Bridge {next_index}')
+                    continue
+
+            normalized_names.append(resolved_name)
+
+        if normalized_names and self._section_family_from_name(sections[-1]['label']) == 'ending':
+            normalized_names[-1] = 'Ending'
+
+        return normalized_names
 
     def _get_guide_aligned_section_timings(
         self,
@@ -2762,6 +3578,7 @@ class AbletonService:
         sequence: List[str],
         beat_position: float,
         bpm: float,
+        meter: Optional[str] = None,
     ) -> Optional[List[Dict[str, float]]]:
         """Build section timings from guide cues when the cue count matches the sequence count."""
         if guide_wav is None or not sequence or bpm <= 0:
@@ -2770,6 +3587,14 @@ class AbletonService:
         transcribed_sections = self._transcribe_guide_sections(guide_wav, sequence)
         if transcribed_sections:
             _, _, duration_seconds = self._get_wav_metadata(guide_wav.path)
+            expanded_sections = self._expand_aligned_sections_to_full_sequence(
+                sequence,
+                transcribed_sections,
+                duration_seconds,
+            )
+            if expanded_sections is not None:
+                transcribed_sections = expanded_sections
+
             song_end_beat = beat_position + ((duration_seconds * bpm) / 60.0)
             resolved_names = None
             if any('target_name' not in section for section in transcribed_sections):
@@ -2792,9 +3617,47 @@ class AbletonService:
                         if 'target_name' in section
                         else resolved_names[index]
                     ),
+                    'source_label': section.get('label'),
+                    'source_text': section.get('text'),
+                    'source_modifiers': list(section.get('modifiers', [])),
                     'start': section_start,
                     'duration': max(1.0, next_start - section_start),
                 })
+
+            section_timings = self._normalize_measure_aware_section_timings(
+                section_timings,
+                meter,
+            )
+            section_timings = self._restore_trailing_tag_before_ending(
+                section_timings,
+                sequence,
+                meter,
+            )
+
+            extra_sections: List[Dict[str, Any]] = []
+            seen_extra_keys: set[tuple[float, str]] = set()
+            raw_section_sets = [
+                self._transcribe_guide_phrase_sections(guide_wav),
+                self._cleanup_guide_transcribed_sections(
+                    self._normalize_guide_transcribed_sections(
+                        self._transcribe_guide_whole_file_sections(guide_wav)
+                    )
+                ),
+            ]
+            for raw_sections in raw_section_sets:
+                for raw_section in raw_sections:
+                    raw_key = (round(float(raw_section['start_seconds']), 3), raw_section['label'])
+                    if raw_key in seen_extra_keys:
+                        continue
+                    seen_extra_keys.add(raw_key)
+                    extra_sections.append(raw_section)
+
+            section_timings = self._split_section_timings_with_extra_cues(
+                section_timings,
+                extra_sections,
+                beat_position,
+                bpm,
+            )
 
             logger.info(f"Using transcribed guide timeline for '{guide_wav.filename}'")
             return section_timings
@@ -2831,6 +3694,142 @@ class AbletonService:
 
         logger.info(f"Using cue-detected guide timing fallback for '{guide_wav.filename}'")
         return section_timings
+
+    def _normalize_measure_aware_section_timings(
+        self,
+        section_timings: List[Dict[str, Any]],
+        meter: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Merge and rebalance guide-native section timings on musical bar boundaries."""
+        if not section_timings:
+            return section_timings
+
+        measure_beats = self._beats_per_measure(meter)
+        normalized: List[Dict[str, Any]] = []
+        for section in section_timings:
+            current = dict(section)
+            current_family = self._section_family_from_name(current.get('source_label') or current['name'])
+            current_text = (current.get('source_text') or '').strip().lower()
+            if not normalized:
+                normalized.append(current)
+                continue
+
+            previous = normalized[-1]
+            previous_family = self._section_family_from_name(previous.get('source_label') or previous['name'])
+            previous_text = (previous.get('source_text') or '').strip().lower()
+            next_family = None
+            if section is not section_timings[-1]:
+                next_index = section_timings.index(section) + 1
+                next_section = section_timings[next_index]
+                next_family = self._section_family_from_name(next_section.get('source_label') or next_section['name'])
+
+            # Same-phrase post-chorus announcements often describe the tail of the current chorus
+            # rather than a separate marker region.
+            if (
+                current_family == 'post chorus'
+                and previous_family == 'chorus'
+                and self._is_close_to_measure_multiple(float(current['duration']), measure_beats)
+                and (
+                    (current_text and current_text == previous_text)
+                    or ('turnaround' in current_text and next_family == 'turnaround')
+                )
+            ):
+                previous['duration'] = float(previous['duration']) + float(current['duration'])
+                continue
+
+            normalized.append(current)
+
+        micro_fragment_threshold = measure_beats * self.GUIDE_TRANSCRIPTION_MICRO_FRAGMENT_MEASURES
+        for index in range(len(normalized) - 1):
+            current = normalized[index]
+            next_section = normalized[index + 1]
+            current_duration = float(current['duration'])
+            next_duration = float(next_section['duration'])
+            pair_total = current_duration + next_duration
+            current_family = self._section_family_from_name(current['name'])
+
+            if (
+                current_duration >= micro_fragment_threshold
+                or pair_total < (2.0 * measure_beats)
+                or current_family in {'tag', 'turnaround', 'ending'}
+                or (current.get('source_label') and self._section_family_from_name(current['source_label']) in {'tag', 'turnaround'})
+                or (current.get('source_label') or '').lower().strip() == 'vamp'
+            ):
+                continue
+
+            target_current_duration: Optional[float] = None
+            previous = normalized[index - 1] if index > 0 else None
+            if previous is not None:
+                previous_family = self._section_family_from_name(previous['name'])
+                if previous_family == current_family:
+                    previous_duration = float(previous['duration'])
+                    target_current_duration = round(previous_duration / measure_beats) * measure_beats
+
+            if target_current_duration is None:
+                target_current_duration = round(pair_total / (2.0 * measure_beats)) * measure_beats
+
+            target_current_duration = min(
+                max(measure_beats, target_current_duration),
+                pair_total - measure_beats,
+            )
+            if not self._is_close_to_measure_multiple(
+                target_current_duration,
+                measure_beats,
+                tolerance_beats=self.GUIDE_TRANSCRIPTION_MEASURE_ALIGNMENT_TOLERANCE_BEATS * 1.5,
+            ):
+                continue
+
+            current['duration'] = target_current_duration
+            next_section['start'] = float(current['start']) + target_current_duration
+            next_section['duration'] = max(1.0, pair_total - target_current_duration)
+
+        return normalized
+
+    def _restore_trailing_tag_before_ending(
+        self,
+        section_timings: List[Dict[str, Any]],
+        sequence: List[str],
+        meter: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Restore a short trailing Tag before an explicit Ending for guide-native chorus/vamp/ending tails."""
+        if len(section_timings) < 3 or not sequence:
+            return section_timings
+
+        if self._section_family_from_name(sequence[-1]) != 'tag':
+            return section_timings
+
+        ending = section_timings[-1]
+        last_chorus = section_timings[-2]
+        prior = section_timings[-3]
+
+        if self._section_family_from_name(ending['name']) != 'ending':
+            return section_timings
+        if self._section_family_from_name(last_chorus['name']) != 'chorus':
+            return section_timings
+        if (prior.get('source_label') or '').lower().strip() != 'vamp':
+            return section_timings
+
+        if any((item.get('source_label') or '').lower().strip() in {'tag', 'refrain'} for item in section_timings[-3:-1]):
+            return section_timings
+
+        measure_beats = self._beats_per_measure(meter)
+        target_tag_duration = min(2.0 * measure_beats, float(last_chorus['duration']) - measure_beats)
+        if target_tag_duration < measure_beats:
+            return section_timings
+
+        restored = [dict(item) for item in section_timings]
+        restored_chorus = restored[-2]
+        restored_chorus['duration'] = float(restored_chorus['duration']) - target_tag_duration
+        tag_start = float(restored_chorus['start']) + float(restored_chorus['duration'])
+        restored.insert(-1, {
+            'name': 'Tag',
+            'source_label': 'tag',
+            'source_text': restored_chorus.get('source_text'),
+            'source_modifiers': list(restored_chorus.get('source_modifiers', [])),
+            'start': tag_start,
+            'duration': target_tag_duration,
+        })
+        return restored
 
     def _select_section_start_beats(
         self,
@@ -2889,6 +3888,70 @@ class AbletonService:
 
         return score
 
+    def _split_section_timings_with_extra_cues(
+        self,
+        section_timings: List[Dict[str, float]],
+        guide_sections: List[Dict[str, Any]],
+        beat_position: float,
+        bpm: float,
+    ) -> List[Dict[str, float]]:
+        """Split generated sections on extra same-family guide cues that fall inside them."""
+        if not section_timings or not guide_sections or bpm <= 0:
+            return section_timings
+
+        split_timings: List[Dict[str, float]] = []
+        for timing in section_timings:
+            section_start = float(timing['start'])
+            section_end = section_start + float(timing['duration'])
+            section_family = self._section_family_from_name(timing['name'])
+
+            matching_cues: List[tuple[float, Dict[str, Any]]] = []
+            for guide_section in guide_sections:
+                cue_start = beat_position + ((float(guide_section['start_seconds']) * bpm) / 60.0)
+                if cue_start <= section_start + 0.5 or cue_start >= section_end - 0.5:
+                    continue
+                if (
+                    cue_start - section_start < self.GUIDE_TRANSCRIPTION_MIN_SPLIT_BEATS
+                    or section_end - cue_start < self.GUIDE_TRANSCRIPTION_MIN_SPLIT_BEATS
+                ):
+                    continue
+
+                cue_family = self._section_family_from_name(guide_section['label'])
+                if cue_family != section_family:
+                    continue
+
+                matching_cues.append((cue_start, guide_section))
+
+            if not matching_cues:
+                split_timings.append(timing)
+                continue
+
+            matching_cues.sort(key=lambda item: item[0])
+            current_start = section_start
+            split_name = timing['name']
+            if section_family == 'tag':
+                split_name = self._display_name_for_guide_label(
+                    matching_cues[0][1]['label'],
+                    matching_cues[0][1].get('modifiers'),
+                    matching_cues[0][1].get('text'),
+                )
+
+            for cue_start, _ in matching_cues:
+                split_timings.append({
+                    'name': split_name,
+                    'start': current_start,
+                    'duration': max(1.0, cue_start - current_start),
+                })
+                current_start = cue_start
+
+            split_timings.append({
+                'name': split_name,
+                'start': current_start,
+                'duration': max(1.0, section_end - current_start),
+            })
+
+        return split_timings
+
     def _expected_section_duration_profile(self, section_name: str) -> tuple[float, float, float]:
         """Return preferred duration bounds for a section label in beats."""
         section_lower = section_name.lower()
@@ -2934,7 +3997,7 @@ class AbletonService:
         logger.info(f"Added guide wav clip '{guide_wav.filename}' at beat {beat_position} to track '{track.find('Name/EffectiveName').get('Value', '')}'")
 
     def _create_arrangement_track(self, tracks: ET.Element) -> Optional[int]:
-        """Create a brand new MIDI track at the top for arrangement clips.
+        """Create a brand new MIDI track at the top for generated marker clips.
         
         Returns the index of the new track (0), or None if creation failed.
         """
@@ -2970,10 +4033,8 @@ class AbletonService:
         # Assign a new unique ID
         new_track.set('Id', str(max_id + 100))
         
-        # Set the track name to "Arrangement"
-        name_elem = new_track.find(".//Name/EffectiveName")
-        if name_elem is not None:
-            name_elem.set('Value', 'Arrangement')
+        # Label the generated row explicitly so it does not inherit the template track name.
+        self._set_track_name(new_track, 'Markers')
         
         # Clear out any existing clips from the new track
         ct = new_track.find(".//ClipTimeable")
@@ -3217,7 +4278,13 @@ class AbletonService:
             logger.warning("Events not found, creating it")
             events = ET.SubElement(arranger_automation, "Events")
 
-        section_timings = self._get_guide_aligned_section_timings(guide_wav, sequence, beat_position, bpm)
+        section_timings = self._get_guide_aligned_section_timings(
+            guide_wav,
+            sequence,
+            beat_position,
+            bpm,
+            song.arrangement.meter if song.arrangement else None,
+        )
         if section_timings is None:
             template_intro_duration = self.TEMPLATE_ARRANGEMENT_INTRO_BEATS
             available_song_duration = 240 - template_intro_duration
@@ -3297,75 +4364,86 @@ class AbletonService:
         else:
             return 58  # Default cyan
 
-    def _create_midi_clip_element(self, name: str, beat_position: float, duration: float, clip_id: int) -> ET.Element:
-        """Create a MidiClip by copying the template clip and modifying key fields.
-        
-        This approach mirrors manual workflow: copy a working clip, then rename it and adjust position.
-        """
-        if self.template_midi_clip is None:
-            logger.error("No template MidiClip available, cannot create clip")
+    def _create_midi_clip_from_template(
+        self,
+        template_clip: Optional[ET.Element],
+        name: str,
+        beat_position: float,
+        duration: float,
+        clip_id: int,
+        color_code: Optional[int] = None,
+        preserve_loop_values: bool = False,
+    ) -> Optional[ET.Element]:
+        """Create a MidiClip by copying a template clip and updating its timeline fields."""
+        if template_clip is None:
+            logger.error(f"No template MidiClip available for '{name}'")
             return None
-        
-        # Deep copy the template clip
-        clip = copy.deepcopy(self.template_midi_clip)
-        
-        # Update the key attributes
+
+        clip = copy.deepcopy(template_clip)
         clip_end = beat_position + duration
-        
+
         clip.set('Id', str(clip_id))
         clip.set('Time', self._format_beat_value(beat_position))
-        
-        # Update the name
+
         name_elem = clip.find('Name')
         if name_elem is not None:
             name_elem.set('Value', name)
-        
-        # Set color based on section type
-        color_code = self._get_clip_color(name)
-        color_elem = clip.find('Color')
-        if color_elem is not None:
-            color_elem.set('Value', str(color_code))
-        
-        # CRITICAL: Update CurrentStart to match Time (Ableton requires this)
-        # When you copy/paste a clip in Ableton, CurrentStart always equals Time
+
+        if color_code is not None:
+            color_elem = clip.find('Color')
+            if color_elem is not None:
+                color_elem.set('Value', str(color_code))
+
         current_start = clip.find('CurrentStart')
         if current_start is not None:
             current_start.set('Value', self._format_beat_value(beat_position))
-        
-        # Update CurrentEnd = Time + duration (the clip's actual duration on timeline)
+
         current_end = clip.find('CurrentEnd')
         if current_end is not None:
             current_end.set('Value', self._format_beat_value(clip_end))
-        
-        # Log what we're setting for this clip
+
         logger.debug(f"Creating clip '{name}': beat_position={beat_position:.2f}, duration={duration:.2f}")
         logger.debug(f"  Set CurrentStart={beat_position:.2f}, CurrentEnd={clip_end:.2f}")
-        
-        # Update Loop fields (these appear to have longer durations, likely from template)
-        # Keep these as relative loop boundaries, not absolute timeline positions
+
         for elem in clip.iter():
-            # For Loop/HiddenLoopEnd (this stays relative to loop, not timeline)
-            if elem.tag == 'Loop':
+            if elem.tag == 'Loop' and not preserve_loop_values:
                 for child in elem:
-                    if child.tag == 'HiddenLoopEnd':
+                    if child.tag in {'LoopEnd', 'OutMarker', 'HiddenLoopEnd'}:
                         child.set('Value', self._format_beat_value(duration))
-                        logger.debug(f"  Set HiddenLoopEnd={duration:.2f}")
-            
-            # For TimeSelection/EndTime
+                    elif child.tag in {'LoopStart', 'StartRelative', 'HiddenLoopStart'}:
+                        child.set('Value', self._format_beat_value(0))
+
             if elem.tag == 'TimeSelection':
                 for child in elem:
                     if child.tag == 'EndTime':
                         child.set('Value', self._format_beat_value(duration))
-        
+
         return clip
+
+    def _create_midi_clip_element(self, name: str, beat_position: float, duration: float, clip_id: int) -> ET.Element:
+        """Create a MidiClip by copying the arrangement template clip and modifying key fields.
+        
+        This approach mirrors manual workflow: copy a working clip, then rename it and adjust position.
+        """
+        color_code = self._get_clip_color(name)
+        return self._create_midi_clip_from_template(
+            template_clip=self.template_midi_clip,
+            name=name,
+            beat_position=beat_position,
+            duration=duration,
+            clip_id=clip_id,
+            color_code=color_code,
+        )
 
 
 
     def _generate_output_path(self, service_type_name: str, service_date) -> Path:
         """Generate the output path for the .als file.
         
-        Format: Service_Type YYYY-MM-DD.als
-        Example: SMC Weekend Services 2026-04-26.als
+        First export keeps the base name; later exports get a numbered regen suffix.
+        Examples:
+        - SMC Weekend Services 2026-04-26.als
+        - SMC Weekend Services 2026-04-26 - Regen 1.als
         
         File goes directly to: /output_folder/Service_Type YYYY-MM-DD.als
         """
@@ -3376,10 +4454,17 @@ class AbletonService:
         date_str = service_date.strftime("%Y-%m-%d")
         
         # Create filename: "Service Type YYYY-MM-DD.als"
-        als_filename = f"{safe_title} {date_str}.als"
-        als_file_path = self.output_folder / als_filename
-        
-        return als_file_path
+        base_name = f"{safe_title} {date_str}"
+        base_path = self.output_folder / f"{base_name}.als"
+        if not base_path.exists():
+            return base_path
+
+        regen_index = 1
+        while True:
+            regen_path = self.output_folder / f"{base_name} - Regen {regen_index}.als"
+            if not regen_path.exists():
+                return regen_path
+            regen_index += 1
 
     def _save_project(self, tree: ET.ElementTree, als_file_path: Path) -> None:
         """Save the modified project as a .als file.

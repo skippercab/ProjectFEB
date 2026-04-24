@@ -37,6 +37,7 @@ class MultitracksService:
     """Service for discovering and matching Multitracks audio stems."""
 
     FOLDER_TRAILING_MODIFIERS = {'sw'}
+    ESSENTIAL_STEM_TYPES = ['vocals', 'perc', 'bass', 'strings', 'keys']
 
     # Common stem types and their variations - organized by Ableton template groups
     STEM_TYPES = {
@@ -73,6 +74,7 @@ class MultitracksService:
         self.config = config
         self.stems_folder = Path(config.stems_folder) if config.stems_folder else None
         self.extracted_archive_dirs: List[Path] = []
+        self.stem_type_overrides: Dict[str, str] = {}
 
         # Build reverse mapping for stem type detection
         self.stem_keywords = {}
@@ -309,6 +311,21 @@ class MultitracksService:
         Handles compound keywords like "Synth Bass" by prioritizing "Bass".
         """
         text_lower = text.lower()
+        normalized_text = self._normalize_stem_override_keyword(text_lower)
+        override_match = self._match_stem_type_override(text_lower)
+        if override_match:
+            return override_match
+
+        # Keyboard compound names should beat the generic "electric" guitar hint.
+        for keys_phrase in (
+            'electric piano',
+            'electric keys',
+            'electric organ',
+            'electric rhodes',
+            'electric wurlitzer',
+        ):
+            if keys_phrase in normalized_text:
+                return 'keys'
         
         # Special handling: if "bass" appears anywhere, check if it's in a compound keyword
         # Compounds like "synth bass", "electric bass" should map to bass category
@@ -357,6 +374,44 @@ class MultitracksService:
         
         # If no match found, return 'unknown' for manual review
         return best_match if best_match else 'unknown'
+
+    def set_stem_type_overrides(self, overrides: Dict[str, str]) -> None:
+        """Replace custom stem-type overrides with persisted user mappings."""
+        normalized_overrides: Dict[str, str] = {}
+        valid_types = set(self.STEM_TYPES.keys())
+        for keyword, stem_type in (overrides or {}).items():
+            normalized_keyword = self._normalize_stem_override_keyword(keyword)
+            normalized_type = str(stem_type).strip().lower()
+            if not normalized_keyword or normalized_type not in valid_types:
+                continue
+            normalized_overrides[normalized_keyword] = normalized_type
+
+        self.stem_type_overrides = normalized_overrides
+
+    def _normalize_stem_override_keyword(self, text: str) -> str:
+        """Normalize a user-provided instrument keyword for matching and persistence."""
+        normalized = re.sub(r'[^a-z0-9]+', ' ', (text or '').lower())
+        return re.sub(r'\s+', ' ', normalized).strip()
+
+    def _match_stem_type_override(self, text: str) -> Optional[str]:
+        """Return a custom override stem type when a remembered keyword is present."""
+        if not self.stem_type_overrides:
+            return None
+
+        normalized_text = self._normalize_stem_override_keyword(text)
+        if not normalized_text:
+            return None
+
+        padded_text = f" {normalized_text} "
+        best_match = None
+        best_length = -1
+        for keyword, stem_type in self.stem_type_overrides.items():
+            padded_keyword = f" {keyword} "
+            if padded_keyword in padded_text and len(keyword) > best_length:
+                best_match = stem_type
+                best_length = len(keyword)
+
+        return best_match
 
     def _extract_song_title(self, filename: str) -> str:
         """Extract song title from filename when no clear separator exists."""
@@ -410,28 +465,64 @@ class MultitracksService:
 
         # Calculate overall match confidence
         avg_confidence = sum(stem.confidence for stem in matched_stems) / len(matched_stems)
-
-        # Check for missing common stems
         available_types = set(stem.stem_type for stem in matched_stems)
-        missing_types = []
-        essential_stems = ['vocals', 'perc', 'bass', 'strings', 'keys']  # Based on Ableton template groups
 
-        for stem_type in essential_stems:
-            if stem_type not in available_types:
-                missing_types.append(stem_type)
-
-        match = StemMatch(
-            song_title=song_title,
-            stems=matched_stems,
-            match_confidence=avg_confidence,
-            missing_stems=missing_types
-        )
+        match = self._build_stem_match(song_title, matched_stems, avg_confidence)
 
         logger.info(f"Found {len(matched_stems)} stems for '{song_title}' (confidence: {avg_confidence:.2f})")
         if 'unknown' in available_types:
             unknown_count = len([s for s in matched_stems if s.stem_type == 'unknown'])
             logger.warning(f"⚠️  {unknown_count} stems categorized as 'unknown' - may need manual review")
         return match
+
+    def _build_stem_match(self, song_title: str, matched_stems: List[AudioStem], avg_confidence: float) -> StemMatch:
+        """Build a StemMatch and recalculate missing groups from current stem types."""
+        available_types = set(stem.stem_type for stem in matched_stems)
+        missing_types = [
+            stem_type for stem_type in self.ESSENTIAL_STEM_TYPES
+            if stem_type not in available_types
+        ]
+        return StemMatch(
+            song_title=song_title,
+            stems=matched_stems,
+            match_confidence=avg_confidence,
+            missing_stems=missing_types,
+        )
+
+    def suggest_override_keyword(self, stem: AudioStem) -> str:
+        """Suggest a reusable keyword for a user stem-type override."""
+        stem_name = stem.path.stem
+        song_variants = self._song_title_match_variants(stem.song_title)
+
+        def matches_song_title(normalized_part: str) -> bool:
+            return any(
+                variant and (normalized_part == variant or variant in normalized_part or normalized_part in variant)
+                for variant in song_variants
+            )
+
+        for separator in [' - ', ' – ', ' — ', '_']:
+            if separator not in stem_name:
+                continue
+            parts = [part.strip() for part in stem_name.split(separator) if part.strip()]
+            for part in parts:
+                normalized_part = self._normalize_stem_override_keyword(part)
+                if not normalized_part:
+                    continue
+                if matches_song_title(normalized_part):
+                    continue
+                return part.strip()
+
+        cleaned_name = re.sub(r'\s*[\(\[\{][^\)\]\}]*[\)\]\}]', '', stem_name)
+        for variant in sorted(song_variants, key=len, reverse=True):
+            if not variant:
+                continue
+            pattern = re.compile(re.escape(variant), flags=re.IGNORECASE)
+            cleaned_name = pattern.sub(' ', cleaned_name)
+
+        cleaned_name = re.sub(r'\b\d+\b', ' ', cleaned_name)
+        cleaned_name = re.sub(r'[^A-Za-z0-9]+', ' ', cleaned_name)
+        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+        return cleaned_name or stem_name
 
     def get_available_stems_summary(self) -> Dict[str, int]:
         """Get a summary of available stems by type."""
