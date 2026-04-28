@@ -3,6 +3,9 @@
   "last_service_type_id": "1524990",
   "stem_type_overrides": {
     "lap steel": "strings",
-    "mellotron": "keys"
+    "mellotron": "keys",
+    "bells": "perc",
+    "baritone": "vocals",
+    "tambourine 1": "perc"
   }
 }

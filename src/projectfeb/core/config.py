@@ -44,7 +44,7 @@ def default_output_buses() -> list[dict[str, Any]]:
             'role': 'content',
             'mode': 'mono',
             'name': 'Keys',
-            'tags': ['piano', 'synth', 'keys'],
+            'tags': ['piano', 'synth', 'keys', 'pads'],
         },
         {
             'slot': 6,

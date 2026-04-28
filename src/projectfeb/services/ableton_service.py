@@ -547,6 +547,7 @@ class AbletonService:
             self._ensure_tracks_send_count(liveset, tracks, send_count)
             self._configure_click_track_routing(tracks)
             self._configure_existing_guide_track_routing(tracks)
+            self._configure_existing_pads_group_routing(tracks)
             self._update_next_pointee_id(liveset)
         else:
             self._sync_sends_pre(liveset, 0)
@@ -624,6 +625,27 @@ class AbletonService:
         for track in tracks.findall('MidiTrack'):
             if 'click' not in self._get_track_name(track).lower():
                 continue
+
+            self._configure_track_send_routing(track, send_indexes)
+    def _configure_existing_pads_group_routing(self, tracks: ET.Element) -> None:
+        """Route the template PADS group to the selected content bus.
+
+        Pads can be assigned explicitly via the `pads` tag, but older configs should
+        still land on synth/keys style returns without requiring an immediate settings edit.
+        """
+        for track in tracks.findall('GroupTrack'):
+            if self._get_track_name(track).strip().lower() != 'pads':
+                continue
+
+            content_bus = self._resolve_content_bus_for_tags(['pads', 'synth', 'keys'])
+            if content_bus is None:
+                logger.warning("No configured content bus matched the template PADS group")
+                return
+
+            send_indexes = [content_bus['send_index']]
+            sub_master_index = self.return_bus_indexes.get('sub_master')
+            if sub_master_index is not None:
+                send_indexes.append(sub_master_index)
 
             self._configure_track_send_routing(track, send_indexes)
             return
@@ -1587,6 +1609,26 @@ class AbletonService:
         if lower_display_string is not None:
             lower_display_string.set('Value', lower_display)
 
+    def _set_midi_routing_channel(self, track: ET.Element, routing_tag: str, channel: int) -> None:
+        """Set a MIDI input/output routing block to a 1-based channel."""
+        routing_elem = track.find(f'.//{routing_tag}')
+        if routing_elem is None:
+            return
+
+        channel_index = max(0, int(channel) - 1)
+
+        target = routing_elem.find('Target')
+        if target is not None:
+            target_value = target.get('Value', '')
+            if '/' in target_value:
+                prefix, _, suffix = target_value.rpartition('/')
+                if suffix.lstrip('-').isdigit():
+                    target.set('Value', f"{prefix}/{channel_index}")
+
+        lower_display_string = routing_elem.find('LowerDisplayString')
+        if lower_display_string is not None:
+            lower_display_string.set('Value', f"Ch. {channel}")
+
     def _configure_track_send_routing(self, track: ET.Element, send_indexes: List[int]) -> None:
         """Route a track to Sends Only and enable only the requested generated buses."""
         self._reset_track_sends(track)
@@ -1720,6 +1762,8 @@ class AbletonService:
         if stem.stem_type == 'keys':
             if 'piano' in stem_name:
                 add_tag('piano')
+            if any(keyword in stem_name for keyword in {'pad', 'strings_pad'}):
+                add_tag('pads')
             if any(keyword in stem_name for keyword in {'synth', 'pad', 'moog', 'additional', 'additionals'}):
                 add_tag('synth')
             if any(keyword in stem_name for keyword in {'keys', 'key ', 'organ', 'rhodes', 'wurlitzer', 'clav'}):
@@ -1743,11 +1787,15 @@ class AbletonService:
 
     def _resolve_content_bus_for_stem(self, stem: AudioStem) -> Optional[Dict[str, Any]]:
         """Resolve the configured content bus for a stem from its ordered routing tags."""
+        return self._resolve_content_bus_for_tags(self._ordered_routing_tags_for_stem(stem))
+
+    def _resolve_content_bus_for_tags(self, tags: List[str]) -> Optional[Dict[str, Any]]:
+        """Resolve the configured content bus for an ordered list of routing tags."""
         content_buses = [bus for bus in self.active_return_buses if bus['role'] == 'content']
         if not content_buses:
             return None
 
-        for tag in self._ordered_routing_tags_for_stem(stem):
+        for tag in tags:
             for bus in content_buses:
                 if tag in bus['tags']:
                     return bus
@@ -4046,6 +4094,9 @@ class AbletonService:
         
         # Label the generated row explicitly so it does not inherit the template track name.
         self._set_track_name(new_track, 'Markers')
+        self._set_track_muted(new_track, True)
+        self._set_midi_routing_channel(new_track, 'MidiInputRouting', 1)
+        self._set_midi_routing_channel(new_track, 'MidiOutputRouting', 1)
         
         # Clear out any existing clips from the new track
         ct = new_track.find(".//ClipTimeable")

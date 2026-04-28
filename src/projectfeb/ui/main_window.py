@@ -1274,6 +1274,7 @@ class SettingsDialog:
         ('orchestra', 'Orchestra'),
         ('strings', 'Strings'),
         ('piano', 'Piano'),
+        ('pads', 'Pads'),
         ('synth', 'Synth'),
         ('keys', 'Keys'),
         ('lead_vocal', 'Lead Vocal'),
