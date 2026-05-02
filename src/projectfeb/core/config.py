@@ -30,7 +30,7 @@ def default_output_buses() -> list[dict[str, Any]]:
             'role': 'content',
             'mode': 'mono',
             'name': 'Lead',
-            'tags': ['lead_line'],
+            'tags': ['lead_line', 'leads'],
         },
         {
             'slot': 4,

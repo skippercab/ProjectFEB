@@ -10,7 +10,7 @@ import wave
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable
+from typing import ClassVar, Dict, List, Optional, Any, Callable
 from dataclasses import dataclass
 from collections import defaultdict
 from loguru import logger
@@ -225,6 +225,7 @@ class AbletonService:
         self.template_format = None  # Will be set to 'zip' or 'gzip' when loading template
         self.template_midi_clip = None  # Template MidiClip to use as base for copies
         self.template_six_eight_midi_clip = None  # Template 6/8 MidiClip to duplicate for meter changes
+        self.template_four_four_midi_clip = None  # Template 4/4 MidiClip to duplicate for meter changes
         self.blank_audio_track_template = create_blank_audio_track_template()
         self.blank_return_track_template = create_blank_return_track_template()
         self.audio_clip_template = create_audio_clip_template()
@@ -412,6 +413,7 @@ class AbletonService:
         """
         self.template_midi_clip = None
         self.template_six_eight_midi_clip = None
+        self.template_four_four_midi_clip = None
 
         try:
             fallback_clip = None
@@ -436,6 +438,10 @@ class AbletonService:
                                 if clip_name == '6/8':
                                     self.template_six_eight_midi_clip = copy.deepcopy(midi_clip)
                                     logger.info(f"Extracted template 6/8 MidiClip: Id={midi_clip.get('Id')}")
+
+                                if clip_name == '4/4':
+                                    self.template_four_four_midi_clip = copy.deepcopy(midi_clip)
+                                    logger.info(f"Extracted template 4/4 MidiClip: Id={midi_clip.get('Id')}")
 
             if self.template_midi_clip is None and fallback_clip is not None:
                 name_elem = fallback_clip.find('Name')
@@ -664,7 +670,7 @@ class AbletonService:
             return
 
     def _populate_existing_markers(self, liveset: ET.Element, stem_matches: Dict[str, StemMatch], plan_songs: Optional[List] = None) -> None:
-        """Replace template's placeholder markers (1), 2), 3), 4)) with actual song titles and keys."""
+        """Populate song locators and expand slots beyond 4 songs when needed."""
         # Find the Locators element
         locators = liveset.find("Locators")
         if locators is None:
@@ -681,7 +687,7 @@ class AbletonService:
         logger.info(f"Found {len(existing_locators)} total markers in template")
 
         # Get songs in API order if available (from plan_songs), otherwise use sorted stems
-        songs_with_keys = []
+        songs_with_keys: List[tuple[str, str]] = []
         if plan_songs:
             # Use the ordered songs from the plan
             for song in plan_songs:
@@ -694,25 +700,135 @@ class AbletonService:
             songs_with_keys = [(title, "") for title in sorted_songs]
             logger.info(f"Using {len(songs_with_keys)} songs in alphabetical order (no plan_songs provided)")
 
-        # Create mapping of placeholder names (1), 2), 3), 4)) to song titles with keys
-        placeholder_map = {str(i+1) + ")": songs_with_keys[i] for i in range(min(len(songs_with_keys), 4))}
-        logger.debug(f"Placeholder mapping: {placeholder_map}")
+        if not songs_with_keys:
+            return
 
-        # Replace only the placeholder markers with actual song titles
+        # Index current placeholder locators by numeric slot, e.g. "1)", "2)", ...
+        placeholder_locators: Dict[int, ET.Element] = {}
         for locator in existing_locators:
             name_elem = locator.find("Name")
-            if name_elem is not None:
-                old_name = name_elem.get('Value', '')
-                # Check if this is a placeholder marker
-                if old_name in placeholder_map:
-                    song_title, key_suffix = placeholder_map[old_name]
-                    new_name = f"{old_name} {song_title}{key_suffix}"
-                    name_elem.set('Value', new_name)
-                    logger.info(f"Replaced placeholder '{old_name}' with '{new_name}'")
-                else:
-                    logger.debug(f"Marker '{old_name}' is not a placeholder, leaving unchanged")
-            else:
-                logger.warning(f"Locator has no Name element")
+            if name_elem is None:
+                continue
+            marker_name = name_elem.get('Value', '').strip()
+            match = re.fullmatch(r'(\d+)\)', marker_name)
+            if not match:
+                continue
+            placeholder_locators[int(match.group(1))] = locator
+
+        if not placeholder_locators:
+            logger.warning("No numeric placeholder markers found in template")
+            return
+
+        # Replace existing placeholders with song names for available slots.
+        for slot, locator in sorted(placeholder_locators.items()):
+            if slot > len(songs_with_keys):
+                continue
+            name_elem = locator.find("Name")
+            if name_elem is None:
+                continue
+            song_title, key_suffix = songs_with_keys[slot - 1]
+            new_name = f"{slot}) {song_title}{key_suffix}"
+            name_elem.set('Value', new_name)
+            logger.info(f"Replaced placeholder '{slot})' with '{new_name}'")
+
+        # Expand template spacing only when we have more songs than existing placeholder slots.
+        max_template_slot = max(placeholder_locators)
+        if len(songs_with_keys) <= max_template_slot:
+            return
+
+        # We intentionally insert extra slots between song 4 and LOOP when available.
+        anchor_slot = 4 if 4 in placeholder_locators else max_template_slot
+        anchor_locator = placeholder_locators.get(anchor_slot)
+        if anchor_locator is None:
+            return
+
+        anchor_time_elem = anchor_locator.find("Time")
+        if anchor_time_elem is None:
+            logger.warning("Anchor song marker has no Time element; cannot expand markers")
+            return
+
+        try:
+            anchor_time = float(anchor_time_elem.get('Value', '0'))
+        except ValueError:
+            logger.warning("Anchor song marker has invalid Time value; cannot expand markers")
+            return
+
+        loop_boundary = None
+        for locator in existing_locators:
+            name_elem = locator.find("Name")
+            time_elem = locator.find("Time")
+            if name_elem is None or time_elem is None:
+                continue
+
+            locator_name = name_elem.get('Value', '').strip().lower()
+            if not locator_name.startswith('loop'):
+                continue
+
+            try:
+                locator_time = float(time_elem.get('Value', '0'))
+            except ValueError:
+                continue
+
+            if locator_time > anchor_time and (loop_boundary is None or locator_time < loop_boundary):
+                loop_boundary = locator_time
+
+        if loop_boundary is None:
+            logger.warning("No LOOP marker found after song 4; cannot expand extra song slots")
+            return
+
+        slot_width = loop_boundary - anchor_time
+        if slot_width <= 0:
+            logger.warning("Invalid slot width between song 4 and LOOP; cannot expand extra song slots")
+            return
+
+        extra_slots = len(songs_with_keys) - anchor_slot
+        shift_amount = slot_width * extra_slots
+
+        # Push everything at/after the loop boundary forward to make room.
+        for locator in existing_locators:
+            time_elem = locator.find("Time")
+            if time_elem is None:
+                continue
+            try:
+                locator_time = float(time_elem.get('Value', '0'))
+            except ValueError:
+                continue
+            if locator_time >= loop_boundary:
+                new_time = locator_time + shift_amount
+                time_elem.set('Value', str(int(new_time) if new_time.is_integer() else new_time))
+
+        # Add new song locators for slots beyond the template capacity.
+        current_max_id = max(
+            (
+                int(locator.get('Id', '0'))
+                for locator in existing_locators
+                if str(locator.get('Id', '0')).isdigit()
+            ),
+            default=0,
+        )
+
+        for slot in range(anchor_slot + 1, len(songs_with_keys) + 1):
+            song_title, key_suffix = songs_with_keys[slot - 1]
+            marker_name = f"{slot}) {song_title}{key_suffix}"
+            marker_time = anchor_time + (slot - anchor_slot) * slot_width
+
+            current_max_id += 1
+            locator = ET.SubElement(locators_list, "Locator")
+            locator.set('Id', str(current_max_id))
+
+            lom_id = ET.SubElement(locator, "LomId")
+            lom_id.set('Value', '0')
+
+            time_elem = ET.SubElement(locator, "Time")
+            time_elem.set('Value', str(int(marker_time) if marker_time.is_integer() else marker_time))
+
+            name_elem = ET.SubElement(locator, "Name")
+            name_elem.set('Value', marker_name)
+
+            annotation_elem = ET.SubElement(locator, "Annotation")
+            annotation_elem.set('Value', '')
+
+            logger.info(f"Added expanded marker '{marker_name}' at beat {time_elem.get('Value')}")
 
     def _set_project_title(self, liveset: ET.Element, title: str) -> None:
         """Set the project title in the LiveSet."""
@@ -796,14 +912,20 @@ class AbletonService:
         if midi_track_idx is None:
             logger.warning("Failed to create arrangement track")
 
+        # Snapshot existing click colors before replacing template meter clips.
+        song_colors_by_start: Dict[float, Optional[str]] = {}
+        for song_idx, song in enumerate(plan_songs):
+            marker_key = self._song_marker_key(song_idx, song)
+            song_start_beat = locators_map.get(marker_key)
+            if song_start_beat is None:
+                continue
+            song_colors_by_start[song_start_beat] = self._get_song_color_from_click_track(tracks, song_start_beat)
+
         self._remove_named_midi_clips(tracks, '6/8')
+        self._remove_named_midi_clips(tracks, '4/4')
 
         for song_idx, song in enumerate(plan_songs):
             self._report_status(f"Building song {song_idx + 1}/{len(plan_songs)}: {song.title}")
-
-            if song.title not in stem_matches:
-                logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/MIDI")
-                continue
 
             marker_key = self._song_marker_key(song_idx, song)
 
@@ -814,28 +936,35 @@ class AbletonService:
             song_start_beat = locators_map[marker_key]
             logger.info(f"Song {song_idx + 1} '{song.title}' starts at beat {song_start_beat}")
 
-            stem_match = stem_matches[song.title]
             bpm = self._resolve_song_bpm(song)
-            song_color = self._get_song_color_from_click_track(tracks, song_start_beat)
+            stem_match = stem_matches.get(song.title)
+            primary_guide_wav = self._select_primary_guide_wav(stem_match.stems) if stem_match is not None else None
+            song_color = song_colors_by_start.get(song_start_beat)
+
+            self._add_meter_signature_clip_for_song(
+                tracks,
+                plan_songs,
+                locators_map,
+                song_idx,
+                song,
+                song_start_beat,
+                primary_guide_wav,
+                bpm,
+                song_color,
+            )
+
+            if stem_match is None:
+                logger.warning(f"Song '{song.title}' not in stem matches, skipping guide/audio/MIDI sections")
+                continue
+
+            if song_color is None:
+                song_color = self._get_song_color_from_click_track(tracks, song_start_beat)
             song_source_key = self._resolve_song_source_key(song, stem_match.stems)
             song_target_key = self._resolve_song_target_key(song, stem_match.stems, song_source_key)
             song_pitch_shift = self._calculate_song_pitch_shift(song_source_key, song_target_key)
             if song_source_key is not None and song_target_key is not None:
                 logger.info(
                     f"Key mapping for '{song.title}': {song_source_key} -> {song_target_key} ({song_pitch_shift:+d} st)"
-                )
-
-            primary_guide_wav = self._select_primary_guide_wav(stem_match.stems)
-            if self._is_six_eight_meter(song.arrangement.meter if song.arrangement else None):
-                self._add_meter_signature_clip_for_song(
-                    tracks,
-                    plan_songs,
-                    locators_map,
-                    song_idx,
-                    song,
-                    song_start_beat,
-                    primary_guide_wav,
-                    bpm,
                 )
 
             if primary_guide_wav and als_file_path is not None:
@@ -1257,6 +1386,11 @@ class AbletonService:
             if duration_seconds > 0:
                 return song_start_beat + ((duration_seconds * bpm) / 60.0)
 
+        # When there is no next song marker and no guide duration, prefer LOOP if available.
+        loop_beat = locators_map.get('LOOP')
+        if loop_beat is not None and loop_beat > song_start_beat:
+            return loop_beat
+
         return song_start_beat + 240.0
 
     def _add_meter_signature_clip_for_song(
@@ -1269,10 +1403,15 @@ class AbletonService:
         song_start_beat: float,
         guide_wav: Optional[AudioStem],
         bpm: float,
+        song_color: Optional[str],
     ) -> None:
-        """Duplicate the template 6/8 clip across the full span of 6/8 songs."""
-        if self.template_six_eight_midi_clip is None:
-            logger.warning("Template 6/8 MidiClip not found; skipping meter overlay clip")
+        """Duplicate the template 4/4 or 6/8 click clip across each song span."""
+        meter_is_six_eight = self._is_six_eight_meter(song.arrangement.meter if song.arrangement else None)
+        meter_name = '6/8' if meter_is_six_eight else '4/4'
+        template_clip = self.template_six_eight_midi_clip if meter_is_six_eight else self.template_four_four_midi_clip
+
+        if template_clip is None:
+            logger.warning(f"Template {meter_name} MidiClip not found; skipping meter overlay clip")
             return
 
         meter_track_idx = self._find_midi_track_by_name(tracks, 'click')
@@ -1306,12 +1445,14 @@ class AbletonService:
             )
         clip_duration = max(1.0, song_end_beat - song_start_beat)
         clip_id = self._next_midi_clip_id(events)
+        meter_color_code = int(song_color) if song_color and song_color.isdigit() else None
         meter_clip = self._create_midi_clip_from_template(
-            template_clip=self.template_six_eight_midi_clip,
-            name='6/8',
+            template_clip=template_clip,
+            name=meter_name,
             beat_position=song_start_beat,
             duration=clip_duration,
             clip_id=clip_id,
+            color_code=meter_color_code,
             preserve_loop_values=True,
         )
         if meter_clip is None:
@@ -1319,7 +1460,7 @@ class AbletonService:
 
         self._insert_midi_clip_in_time_order(events, meter_clip)
         logger.info(
-            f"Added 6/8 meter clip for '{song.title}' from beat {song_start_beat:.2f} to {song_end_beat:.2f}"
+            f"Added {meter_name} meter clip for '{song.title}' from beat {song_start_beat:.2f} to {song_end_beat:.2f}"
         )
 
     def _find_track_by_name(self, tracks: ET.Element, search_name: str) -> Optional[int]:
@@ -1638,24 +1779,80 @@ class AbletonService:
             self._set_track_send_level(track, send_index, 1.0)
 
     def _configure_generated_audio_track_routing(self, track: ET.Element, send_indexes: List[int]) -> None:
-        """Route generated audio tracks into the selected logical return buses."""
-        self._configure_track_send_routing(track, send_indexes)
+        """Route generated audio tracks into the selected logical return buses.
+
+        When send_indexes is empty the track outputs to its parent group instead
+        of Sends Only, so routing is controlled entirely by the stem group.
+        """
+        if send_indexes:
+            self._configure_track_send_routing(track, send_indexes)
+        else:
+            self._reset_track_sends(track)
+            self._set_audio_output_routing(track, 'AudioOut/GroupTrack', 'Group')
+
+    # Maps stem_type → ordered routing tags for content-bus lookup at the GROUP level.
+    # Ordered broad → specific so the widest matching bus wins first; if the user has
+    # only granular returns (e.g. 'acoustic_guitar' + 'electric_guitar' but no 'strings')
+    # the lookup still falls through and finds a match.
+    _STEM_TYPE_ROUTING_TAGS: ClassVar[Dict[str, List[str]]] = {
+        'perc':    ['perc', 'drums', 'loops', 'percussion'],
+        'bass':    ['bass'],
+        'leads':   ['lead_line', 'leads', 'electric_guitar', 'acoustic_guitar', 'guitars'],
+        'strings': ['strings', 'guitars', 'electric_guitar', 'acoustic_guitar', 'lead_line', 'orchestra'],
+        'keys':    ['keys', 'piano', 'synth', 'pads'],
+        'vocals':  ['vocals', 'lead_vocal', 'bgvs'],
+    }
+
+    def _send_indexes_for_stem_type(self, stem_type: str) -> List[int]:
+        """Return the active send indexes for a stem group track based on stem type.
+
+        Searches the full ordered tag list for the stem type (broad → specific) so
+        the lookup works regardless of whether the user has a single broad return
+        bus (e.g. 'strings'), separate per-instrument returns (e.g. 'acoustic_guitar'
+        + 'electric_guitar'), or any other custom layout.
+        """
+        send_indexes: List[int] = []
+        routing_tags = self._STEM_TYPE_ROUTING_TAGS.get(stem_type, [stem_type])
+        content_bus = self._resolve_content_bus_for_tags(routing_tags)
+        if content_bus is not None:
+            send_indexes.append(content_bus['send_index'])
+        else:
+            logger.warning(f"No configured content bus matched stem type '{stem_type}'")
+
+        sub_master_index = self.return_bus_indexes.get('sub_master')
+        if sub_master_index is not None:
+            send_indexes.append(sub_master_index)
+
+        return send_indexes
 
     def _configure_generated_group_track(
         self,
         track: ET.Element,
         parent_group_id: Optional[int],
         stem_type: Optional[str] = None,
+        send_indexes: Optional[List[int]] = None,
     ) -> None:
-        """Configure generated song/category groups using real GroupTrack XML."""
+        """Configure generated song/category groups using real GroupTrack XML.
+
+        Stem-type groups (Perc, Bass, etc.) carry the content-bus send so that
+        moving a leaf track between stem groups automatically picks up the new
+        routing without requiring per-track rewiring.
+        """
         self._set_track_group_id(track, parent_group_id)
-        self._reset_track_sends(track)
 
         if parent_group_id is None:
+            # Top-level song group: output via sends to the mix buses.
+            self._reset_track_sends(track)
             self._set_audio_output_routing(track, 'AudioOut/None', 'Sends Only')
             return
 
-        self._set_audio_output_routing(track, 'AudioOut/GroupTrack', 'Group')
+        if send_indexes:
+            # Stem group with explicit routing: send to content buses.
+            self._configure_track_send_routing(track, send_indexes)
+        else:
+            # Stem group with no routing: pass audio up to parent group.
+            self._reset_track_sends(track)
+            self._set_audio_output_routing(track, 'AudioOut/GroupTrack', 'Group')
 
     def _select_song_audio_wavs(self, stems: List[AudioStem]) -> List[AudioStem]:
         """Return non-guide WAV stems that can be routed into generated audio tracks."""
@@ -1743,6 +1940,17 @@ class AbletonService:
 
         if stem.stem_type == 'bass':
             add_tag('bass')
+            return tags
+
+        if stem.stem_type == 'leads':
+            if any(keyword in stem_name for keyword in {'ag', 'acoustic'}):
+                add_tag('acoustic_guitar')
+                add_tag('guitars')
+            if any(keyword in stem_name for keyword in {'eg', 'electric', 'ax', 'axe', 'gtr'}):
+                add_tag('electric_guitar')
+                add_tag('guitars')
+            add_tag('lead_line')
+            add_tag('leads')
             return tags
 
         if stem.stem_type == 'strings':
@@ -2256,7 +2464,12 @@ class AbletonService:
         song_color: Optional[str],
         pitch_shift: int,
     ) -> bool:
-        """Create Song -> Stem Group -> Audio Track hierarchy for a song's routed WAVs."""
+        """Create Song -> Bus Group -> Audio Track hierarchy for a song's routed WAVs.
+
+        Sub-groups are created one-per-content-bus (not one-per-stem-type), so the
+        session hierarchy always matches the user's configured return track layout.
+        A user with 3 buses (Perc / Bass / Lead) gets 3 sub-groups; one with 6 gets 6.
+        """
         if self._find_group_track_template(tracks) is None:
             return False
 
@@ -2273,44 +2486,76 @@ class AbletonService:
 
         insert_index += 1
         song_group_id = int(song_group.get('Id', '-1'))
-        grouped_stems = self._group_song_audio_wavs(audio_stems)
 
-        for stem_type in self.STEM_GROUP_ORDER:
-            stems_for_type = grouped_stems.get(stem_type)
-            needs_placeholder = stem_type == 'leads' and not stems_for_type
-            if not stems_for_type and not needs_placeholder:
-                continue
+        # --- Resolve each stem to its content bus and bucket accordingly ---
+        stems_by_bus: Dict[int, List[AudioStem]] = {}
+        for audio_stem in audio_stems:
+            bus = self._resolve_content_bus_for_stem(audio_stem)
+            if bus is not None:
+                stems_by_bus.setdefault(bus['send_index'], []).append(audio_stem)
+
+        # Sort stems inside each bucket using the stable sort key.
+        for key in stems_by_bus:
+            stems_by_bus[key] = sorted(stems_by_bus[key], key=self._audio_stem_sort_key)
+
+        # --- Determine which buses need a sub-group ---
+        active_content_buses = [b for b in self.active_return_buses if b['role'] == 'content']
+
+        # Leads placeholder: if no leads stems exist, we still want a blank track
+        # so the engineer remembers the slot is available.  Find which bus leads live on.
+        has_leads_stems = any(s.stem_type == 'leads' for s in audio_stems)
+        leads_bus: Optional[Dict[str, Any]] = None
+        if not has_leads_stems:
+            leads_tags = self._STEM_TYPE_ROUTING_TAGS.get('leads', ['leads'])
+            leads_bus = self._resolve_content_bus_for_tags(leads_tags)
+
+        bus_indexes_needed: set = set(stems_by_bus.keys())
+        if leads_bus is not None:
+            bus_indexes_needed.add(leads_bus['send_index'])
+
+        buses_to_create = [b for b in active_content_buses if b['send_index'] in bus_indexes_needed]
+
+        sub_master_index = self.return_bus_indexes.get('sub_master')
+
+        for bus in buses_to_create:
+            bus_stems = stems_by_bus.get(bus['send_index'], [])
+
+            bus_send_indexes: List[int] = [bus['send_index']]
+            if sub_master_index is not None:
+                bus_send_indexes.append(sub_master_index)
 
             stem_group = self._create_group_track(
                 liveset,
                 tracks,
-                self.STEM_GROUP_NAMES[stem_type],
+                bus['name'],
                 track_color=song_color,
                 parent_group_id=song_group_id,
-                stem_type=stem_type,
+                send_indexes=bus_send_indexes,
                 insert_index=insert_index,
             )
 
-            parent_group_id = song_group_id
+            group_parent_id = song_group_id
             if stem_group is not None:
-                parent_group_id = int(stem_group.get('Id', '-1'))
+                group_parent_id = int(stem_group.get('Id', '-1'))
                 insert_index += 1
 
-            if needs_placeholder:
+            # Placeholder when this bus is the leads bus and has no actual stems.
+            is_leads_bus = leads_bus is not None and bus['send_index'] == leads_bus['send_index']
+            if is_leads_bus and not bus_stems:
                 placeholder_track = self._create_audio_track(
                     liveset,
                     tracks,
-                    self._build_placeholder_track_name(song_title, stem_type),
-                    stem_type,
+                    self._build_placeholder_track_name(song_title, 'leads'),
+                    'leads',
                     song_color,
-                    parent_group_id=parent_group_id,
+                    parent_group_id=group_parent_id,
                     insert_index=insert_index,
                 )
                 if placeholder_track is not None:
                     insert_index += 1
                 continue
 
-            for audio_stem in stems_for_type:
+            for audio_stem in bus_stems:
                 logger.info(
                     f"Adding {audio_stem.stem_type} wav for '{song_title}' at beat {beat_position}: {audio_stem.filename}"
                 )
@@ -2321,8 +2566,8 @@ class AbletonService:
                     track_name,
                     audio_stem.stem_type,
                     song_color,
-                    parent_group_id=parent_group_id,
-                    send_indexes=self._send_indexes_for_audio_stem(audio_stem),
+                    parent_group_id=group_parent_id,
+                    send_indexes=[],   # leaf tracks output to group; routing is on the group
                     insert_index=insert_index,
                 )
                 if new_track is not None:
@@ -4263,6 +4508,7 @@ class AbletonService:
         track_color: Optional[str] = None,
         parent_group_id: Optional[int] = None,
         stem_type: Optional[str] = None,
+        send_indexes: Optional[List[int]] = None,
         insert_index: Optional[int] = None,
     ) -> Optional[ET.Element]:
         """Create a new GroupTrack by cloning a real template group from the source set."""
@@ -4277,11 +4523,17 @@ class AbletonService:
             new_track.set('Id', str(next_id))
             next_id += 1
 
+            # Strip any effects (e.g. reverb on the PADS template) from the clone.
+            devices_elem = new_track.find('DeviceChain/DeviceChain/Devices')
+            if devices_elem is not None:
+                for device in list(devices_elem):
+                    devices_elem.remove(device)
+
             next_id = self._remap_audio_track_internal_ids(new_track, next_id)
             self._set_track_name(new_track, track_name)
             self._set_track_color(new_track, track_color)
             self._set_track_volume(new_track, 1.0)
-            self._configure_generated_group_track(new_track, parent_group_id, stem_type)
+            self._configure_generated_group_track(new_track, parent_group_id, stem_type, send_indexes)
 
             for selected_elem in new_track.iter('IsContentSelectedInDocument'):
                 selected_elem.set('Value', 'false')
