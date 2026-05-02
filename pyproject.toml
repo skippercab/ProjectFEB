@@ -5,23 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "project-feb"
 version = "2.0.0"
-description = "Planning Center Online to Ableton Live setlist generator"
+description = "Rider: The Final Editing Bridge for Planning Center and Ableton Live setlists"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "customtkinter>=5.2.0",
+    "Pillow>=10.0.0",
     "requests>=2.28.0",
     "python-dotenv>=1.0.0",
     "pandas>=1.5.0",
@@ -41,7 +42,8 @@ Repository = "https://github.com/yourusername/project-feb.git"
 Issues = "https://github.com/yourusername/project-feb/issues"
 
 [project.scripts]
-projectfeb = "projectfeb.main:main"
+projectfeb = "main:main"
+rider = "main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -51,7 +53,7 @@ where = ["src"]
 
 [tool.black]
 line-length = 88
-target-version = ['py38']
+target-version = ['py310']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -68,7 +70,7 @@ extend-exclude = '''
 '''
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

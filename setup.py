@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Setup script for Project FEB."""
+"""Setup script for Rider."""
 
 import sys
 import json
@@ -8,15 +8,19 @@ from typing import Dict, Any
 
 def main():
     """Run the setup process."""
-    print("🎵 Project FEB Setup")
+    print("🎵 Rider Setup")
     print("=" * 50)
 
     # Check Python version
-    if sys.version_info < (3, 8):
-        print("❌ Python 3.8 or higher is required")
+    if sys.version_info < (3, 10):
+        print("❌ Python 3.10 or higher is required")
         sys.exit(1)
 
     print(f"✅ Python {sys.version.split()[0]} detected")
+    if sys.version_info[:2] == (3, 14):
+        print("✅ Python 3.14 is supported")
+    elif sys.version_info[:2] < (3, 14):
+        print("ℹ️ Python 3.14 is the current recommended target for new local environments")
 
     # Create config directory if it doesn't exist
     config_dir = Path("config")
@@ -49,7 +53,9 @@ def main():
     # Check if dependencies are installed
     print("\n📦 Checking dependencies...")
     try:
+        import tkinter
         import customtkinter
+        import PIL
         import requests
         import fuzzywuzzy
         print("✅ Core dependencies are installed")
@@ -58,7 +64,7 @@ def main():
         print(f"Error: {e}")
 
     print("\n🎉 Setup complete!")
-    print("Run 'python -m projectfeb' to start the application.")
+    print("Run Rider with 'python run.py' or 'python -m projectfeb'.")
 
 def get_default_config() -> Dict[str, Any]:
     """Get default configuration."""

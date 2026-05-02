@@ -1,4 +1,4 @@
-"""Package entry point for Project FEB."""
+"""Package entry point for Rider."""
 
 from .main import main
 

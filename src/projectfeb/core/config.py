@@ -1,4 +1,4 @@
-"""Configuration management for Project FEB."""
+"""Configuration management for Rider."""
 
 import json
 import os
@@ -30,7 +30,7 @@ def default_output_buses() -> list[dict[str, Any]]:
             'role': 'content',
             'mode': 'mono',
             'name': 'Lead',
-            'tags': ['lead_line'],
+            'tags': ['lead_line', 'leads'],
         },
         {
             'slot': 4,
@@ -44,7 +44,7 @@ def default_output_buses() -> list[dict[str, Any]]:
             'role': 'content',
             'mode': 'mono',
             'name': 'Keys',
-            'tags': ['piano', 'synth', 'keys'],
+            'tags': ['piano', 'synth', 'keys', 'pads'],
         },
         {
             'slot': 6,

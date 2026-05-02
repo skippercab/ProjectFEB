@@ -125,4 +125,4 @@ dmypy.json
 # Application specific
 config/settings.json
 *.als
-logs/
+logs/.vscode
