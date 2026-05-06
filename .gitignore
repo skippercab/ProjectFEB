@@ -126,3 +126,8 @@ dmypy.json
 config/settings.json
 *.als
 logs/.vscode
+
+# Build venv and generated artifacts
+.venv_build/
+.DS_Store
+*.plist

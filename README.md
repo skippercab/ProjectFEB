@@ -1,173 +1,173 @@
 # Rider
 
-Rider: The Final Editing Bridge is a desktop app that turns Planning Center service plans and Multitracks stems into ready-to-open Ableton Live setlists. It pulls the songs for a service, finds the matching audio stems, builds grouped tracks from your template, and generates marker clips and timing data so the set is usable with minimal manual cleanup.
+**A magical bridge from plan to performance.**
 
-## Features
+Rider is a macOS desktop app that connects Planning Center and Ableton Live. Give it a service plan, point it at your Multitracks stems folder, and it builds a complete, ready-to-open Ableton setlist — grouped tracks, click clips, markers, routing, and all — in seconds.
 
-- Planning Center Online plan and song import
-- Multitracks stem discovery with fuzzy song matching
-- Unknown-stem review and remembered stem-type overrides
-- Ableton `.als` generation from a user-supplied template
-- Guide-aware marker clip generation with song-structure alignment
-- Meter-aware behavior for 4/4 and 6/8 songs
-- Regenerated exports use numbered `Regen` filenames instead of overwriting older sets
-- Generated tracks inside groups are ordered naturally by stem name
+---
 
-## Requirements
+## Download & Install (macOS — no coding required)
 
-- Python 3.10 or newer
-- Python 3.14 recommended for new installs
-- A Python build with Tk support (`python -c "import tkinter"` must succeed)
-- A Planning Center account with API credentials
-- A local Multitracks stems folder
-- An Ableton Live template `.als` file
+> **This is the only section you need if you just want to run Rider.**
 
-## Installation
+### Step 1 — Download the DMG
+
+1. Go to **[github.com/skippercab/ProjectFEB/releases](https://github.com/skippercab/ProjectFEB/releases)**
+2. Under the latest release, click **`Rider-2.0.0.dmg`** to download it.
+
+### Step 2 — Install the app
+
+1. Open the downloaded **`Rider-2.0.0.dmg`** file (double-click it in your Downloads folder).
+2. A window will appear showing the Rider icon and an Applications folder.
+3. **Drag the Rider icon onto the Applications folder.**
+4. Once copied, eject the DMG (drag it to the Trash or press ⌘E).
+
+### Step 3 — Open Rider for the first time
+
+Because Rider isn't distributed through the Mac App Store, macOS will show a security warning the first time.
+
+1. Open your **Applications** folder (Finder → Go → Applications).
+2. **Right-click** (or Control-click) on **Rider** and choose **Open**.
+3. Click **Open** in the dialog that appears.
+
+After that first launch you can open Rider normally by double-clicking it or keeping it in your Dock.
+
+---
+
+## First-time setup
+
+When Rider opens for the first time it will ask you to configure a few things. You only need to do this once.
+
+### Planning Center API credentials
+
+Rider needs read access to your Planning Center account.
+
+1. Go to [api.planningcenteronline.com/personal_access_tokens](https://api.planningcenteronline.com/personal_access_tokens) and sign in.
+2. Create a new **Personal Access Token** in the upper right corner.
+3. Copy the **Application ID** and **Secret** into Rider's Settings screen.
+
+### Multitracks stems folder
+
+Point Rider at the folder on your computer where your downloaded Multitracks stems live. Rider supports all common folder layouts (flat, `MultiTracks/`, `Samples/Imported/`, etc.).
+
+### Ableton template
+
+Point Rider at the `.als` template file you want every setlist to be built from. Rider copies this file and fills it in — your original is never modified.
+
+### Output folder
+
+Choose where Rider should save the finished Ableton project folders.
+
+---
+
+## How to generate a setlist
+
+1. Launch Rider.
+2. Choose your **Service Type** and **Plan date** from the dropdowns.
+3. Rider fetches the song list from Planning Center and searches your stems folder.
+4. Review the matched stems. Resolve any unknowns if prompted (Rider remembers your choices for next time).
+5. Click **Generate**. Rider builds the `.als` file and opens the output folder when done.
+6. Open the project in Ableton Live.
+
+---
+
+## What Rider builds
+
+- **Song markers** at the correct beat positions — including sets with more than 4 songs
+- **Click track clips** with the correct meter (4/4 or 6/8) and song color for every song
+- **Grouped track hierarchy** that mirrors your configured return bus layout — if you have 3 return buses (Perc / Bass / Lead) you get 3 sub-groups per song; if you have 6, you get 6
+- **Stem routing on the group**, not on individual tracks — move a guitar from Strings to Lead in Ableton and it automatically inherits the new routing
+- **Lead Guitar placeholder** in every song so the slot is always visible even when no stems are present
+- **Regen exports** use numbered suffixes (`- Regen 1`, `- Regen 2`, …) so older sets are never overwritten
+
+---
+
+## Return bus layout
+
+Rider's track grouping adapts to however you have your return buses configured in Settings. The default layout is:
+
+| Slot | Name | Handles |
+|------|------|---------|
+| A | Perc | Drums, loops, percussion |
+| B | Bass | Bass |
+| C | Lead | Lead lines, guitars |
+| D | Strings | Strings, orchestra, guitars |
+| E | Keys | Keys, piano, synth, pads |
+| F | Vocals | Lead vocal, BGVs |
+| G | Click | Click track |
+| H | Guide | Guide / scratch track |
+
+You can add, remove, or rename buses in Settings and Rider will build the session to match.
+
+---
+
+## Rebuilding from source (developers only)
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/skippercab/ProjectFEB.git
 cd ProjectFEB
-python3.14 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -c "import tkinter"
-python setup.py
-```
-
-You can also run the app with any existing Python 3.10+ virtual environment, as long as that interpreter has Tk support.
-
-## Configuration
-
-Rider reads its settings from `config/settings.json`.
-
-Example:
-
-```json
-{
-   "planning_center": {
-      "application_id": "your_app_id",
-      "secret": "your_secret"
-   },
-   "multitracks": {
-      "stems_folder": "/path/to/your/stems"
-   },
-   "ableton": {
-      "template_path": "/path/to/your/template.als",
-      "output_folder": "/path/to/output/folder"
-   }
-}
-```
-
-You will need:
-
-- Planning Center API credentials from https://api.planningcenteronline.com/oauth/applications
-- A valid local path to your Multitracks stems directory
-- A valid local path to the Ableton template you want to duplicate and populate
-
-## Usage
-
-1. Launch the app.
-2. Select a Planning Center folder, service type, and plan.
-3. Review the matched stems.
-4. Resolve any unknown stems if prompted.
-5. Generate the setlist.
-
-Run it with either of these:
-
-```bash
 python run.py
 ```
 
-```bash
-python -m projectfeb
-```
-
-If `python run.py` fails with `_tkinter`, your interpreter was built without Tk support. Switch to a Tk-enabled Python and recreate the virtual environment before launching Rider.
-
-## Output
-
-Generated Ableton sets are written to the configured `output_folder`.
-
-- The first export uses the base service name and date.
-- Later exports use ` - Regen N` suffixes.
-- Guide tracks and marker clips are generated from the matched stems and song arrangements.
-- Audio tracks are created under grouped song folders using the routing structure from the template.
-
-## Stem Discovery
-
-Rider supports several common Multitracks folder structures, including direct song folders, `MultiTracks/`, and `Samples/Imported/` layouts.
-
-It categorizes stems into the template groups used by the app:
-
-- `perc`
-- `bass`
-- `leads`
-- `strings`
-- `keys`
-- `vocals`
-- `guide`
-
-Song titles are normalized before matching, so common folder modifiers like key, tempo, and switch suffixes do not prevent a match.
-
-## Development
-
-Run tests:
+### Rebuild the distributable app
 
 ```bash
-pytest
+# Build the .app
+source .venv_build/bin/activate
+pyinstaller --clean --noconfirm Rider.spec
+
+# Package as DMG
+dmgbuild -s dmg_settings.py -D app=dist/Rider.app "Rider" dist/Rider-2.0.0.dmg
 ```
 
-Common local quality commands:
+Or run the convenience script which does both and offers to install to `/Applications`:
 
 ```bash
-black src/
-flake8 src/
-mypy src/
+bash build_app.sh
 ```
 
-Build the package:
-
-```bash
-python setup.py build
-```
+---
 
 ## Troubleshooting
 
-**No service plans found**
-
-- Verify your Planning Center credentials.
-- Confirm the selected folder and service type are correct.
-
-**No stems found**
-
-- Verify the `stems_folder` path.
-- Confirm the song folders and filenames are present locally.
-- Review any unknown-stem prompts and save overrides when needed.
-
-**Template file not found**
-
-- Verify `template_path` points to an existing `.als` file.
-- Confirm the file is readable from this machine.
-
-**Generated set looks stale**
-
-- Check the configured output folder for the newest `Regen` export.
-
-**`ModuleNotFoundError: No module named '_tkinter'`**
-
-- Rider is a desktop Tk app, so the Python interpreter itself must include Tk support.
-- Verify the active interpreter with `python -c "import sys; print(sys.executable)"`.
-- Verify Tk support with `python -c "import tkinter"`.
-- If that import fails, install or use a Tk-enabled Python 3.10+ build, recreate your virtual environment, and reinstall requirements.
-
-## Project Layout
-
-```text
-src/projectfeb/
-   core/
-   services/
-   ui/
+**"Rider is damaged and can't be opened"**
+Open Terminal and run:
 ```
+xattr -dr com.apple.quarantine /Applications/Rider.app
+```
+Then try opening again.
+
+**No service plans found**
+Verify your Planning Center API credentials in Settings and confirm the selected service type has plans.
+
+**No stems found for a song**
+Check that the song folder exists inside your configured stems folder and that the folder name is close to the Planning Center song title. Rider uses fuzzy matching but a very different name may not match.
+
+**Generated set looks wrong / I already generated this plan**
+Rider auto-increments the filename (`- Regen 1`, `- Regen 2`, …). Open the latest Regen file in your output folder.
+
+**App opens but shows a blank window**
+Check `output.log` in the ProjectFEB source folder (if running from source) for error details.
+
+---
+
+## Project layout
+
+```
+src/projectfeb/
+  core/        configuration, data models
+  services/    Ableton generation, Planning Center API, stem discovery
+  ui/          CustomTkinter interface
+config/        settings.json, preferences.json
+template/      base Ableton template
+img/           app icon and DMG assets
+font/          Gotham Narrow typeface
+```
+
+---
 
 ## License
 
