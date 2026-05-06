@@ -1352,13 +1352,6 @@ class SettingsDialog:
         # Ableton Section
         ab_frame = self._create_section(main_frame, "Ableton Live")
         
-        self.template_path_entry = self._create_file_field(
-            ab_frame,
-            "Template Path:",
-            self.config.ableton.template_path,
-            is_directory=False
-        )
-        
         self.output_folder_entry = self._create_file_field(
             ab_frame,
             "Output Folder:",
@@ -1782,7 +1775,6 @@ class SettingsDialog:
             self.config.planning_center.application_id = self.pco_app_id_entry.get().strip()
             self.config.planning_center.secret = self.pco_secret_entry.get().strip()
             self.config.multitracks.stems_folder = self.stems_folder_entry.get().strip()
-            self.config.ableton.template_path = self.template_path_entry.get().strip()
             self.config.ableton.output_folder = self.output_folder_entry.get().strip()
             self.config.ableton.output_buses = output_buses
             self.config.ableton.enable_sub_master = bool(self.sub_master_switch.get())
@@ -1807,13 +1799,6 @@ class SettingsDialog:
                 messagebox.showwarning(
                     "Validation Error",
                     "Multitracks stems folder does not exist."
-                )
-                return
-            
-            if self.config.ableton.template_path and not Path(self.config.ableton.template_path).exists():
-                messagebox.showwarning(
-                    "Validation Error",
-                    "Ableton template file does not exist."
                 )
                 return
             
