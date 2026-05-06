@@ -4601,7 +4601,16 @@ class AbletonService:
         )
         if section_timings is None:
             template_intro_duration = self.TEMPLATE_ARRANGEMENT_INTRO_BEATS
+            # Use guide WAV duration (in beats) when available so sections span
+            # the actual song rather than a hardcoded 240-beat estimate.
             available_song_duration = 240 - template_intro_duration
+            if guide_wav is not None and bpm > 0:
+                _, _, _dur_sec = self._get_wav_metadata(guide_wav.path)
+                if _dur_sec > 0:
+                    available_song_duration = max(
+                        available_song_duration,
+                        (_dur_sec * bpm / 60.0) - template_intro_duration,
+                    )
             beats_per_section = available_song_duration / num_sections if num_sections > 0 else available_song_duration
             section_timings = [
                 {
@@ -4616,7 +4625,7 @@ class AbletonService:
             logger.info(
                 f"  Song starts at beat {beat_position}, arrangement sections start at beat {beat_position + template_intro_duration}"
             )
-            logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration} available beats")
+            logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration:.1f} available beats")
         else:
             logger.info(f"Adding {len(section_timings)} guide-aligned MIDI clips for '{song.title}'")
         
@@ -4753,32 +4762,97 @@ class AbletonService:
 
     def _generate_output_path(self, service_type_name: str, service_date) -> Path:
         """Generate the output path for the .als file.
-        
-        First export keeps the base name; later exports get a numbered regen suffix.
-        Examples:
-        - SMC Weekend Services 2026-04-26.als
-        - SMC Weekend Services 2026-04-26 - Regen 1.als
-        
-        File goes directly to: /output_folder/Service_Type YYYY-MM-DD.als
+
+        Output is wrapped in an Ableton-style project folder:
+          output_folder/
+            Service Type YYYY-MM-DD/
+              Service Type YYYY-MM-DD.als        (first run)
+              Service Type YYYY-MM-DD - Regen 1.als  (subsequent runs)
         """
         # Clean service type name (keep spaces but remove special chars)
         safe_title = "".join(c for c in service_type_name if c.isalnum() or c in (' ', '-')).rstrip()
-        
+
         # Format date as YYYY-MM-DD
         date_str = service_date.strftime("%Y-%m-%d")
-        
-        # Create filename: "Service Type YYYY-MM-DD.als"
+
         base_name = f"{safe_title} {date_str}"
-        base_path = self.output_folder / f"{base_name}.als"
+        project_folder = self.output_folder / base_name
+        base_path = project_folder / f"{base_name}.als"
         if not base_path.exists():
             return base_path
 
         regen_index = 1
         while True:
-            regen_path = self.output_folder / f"{base_name} - Regen {regen_index}.als"
+            regen_path = project_folder / f"{base_name} - Regen {regen_index}.als"
             if not regen_path.exists():
                 return regen_path
             regen_index += 1
+
+    def _copy_template_samples(self, tree: ET.ElementTree, als_file_path: Path) -> None:
+        """Copy template Samples/ folder alongside the output .als and fix FileRef entries.
+
+        Ableton uses two mechanisms to locate samples:
+          1. RelativePath (relative to the .als) — used when HasRelativePath="true"
+          2. Absolute Path — fallback, machine-specific
+
+        The template XML may be missing HasRelativePath entirely (defaults to false),
+        causing Ableton to ignore RelativePath and only try the baked-in absolute path.
+        This method:
+          - Copies the Samples/ tree next to the output .als
+          - Sets HasRelativePath="true" on every relevant FileRef
+          - Rewrites the absolute Path to the copied Samples location
+        """
+        import shutil
+
+        template_samples_src = Path(self.template_path).parent / 'Samples'
+        if not template_samples_src.exists():
+            logger.warning(f"Template Samples folder not found at {template_samples_src}; skipping copy")
+            return
+
+        output_samples_dst = als_file_path.parent / 'Samples'
+        try:
+            for src_file in template_samples_src.rglob('*'):
+                if not src_file.is_file():
+                    continue
+                relative = src_file.relative_to(template_samples_src)
+                dst_file = output_samples_dst / relative
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                if not dst_file.exists():
+                    shutil.copy2(src_file, dst_file)
+            logger.info(f"Template samples copied to {output_samples_dst}")
+        except Exception as e:
+            logger.error(f"Failed to copy template samples: {e}")
+            return
+
+        # Fix every FileRef that has a Samples/-relative path
+        for fileref in tree.getroot().iter('FileRef'):
+            rel_el = fileref.find('RelativePath')
+            path_el = fileref.find('Path')
+            if rel_el is None:
+                continue
+            rel_val = rel_el.get('Value', '')
+            if not rel_val.startswith('Samples/'):
+                continue
+
+            # Switch to absolute mode so Ableton uses Path directly.
+            # RelativePathType="3" (project-relative) requires an "Ableton Project Info/"
+            # folder to resolve — without it Ableton marks files missing even when the
+            # absolute Path is correct.  Setting RelativePathType="0" makes Ableton use
+            # the Path element unconditionally, which we rewrite to the copied location.
+            rel_type_el = fileref.find('RelativePathType')
+            if rel_type_el is not None:
+                rel_type_el.set('Value', '0')
+
+            # If a HasRelativePath element is present (e.g., from a previous run), disable it
+            # so Ableton does not attempt relative-path resolution.
+            has_rel_el = fileref.find('HasRelativePath')
+            if has_rel_el is not None:
+                has_rel_el.set('Value', 'false')
+
+            # Rewrite absolute path to the copied Samples location
+            if path_el is not None:
+                sub_path = rel_val[len('Samples/'):]
+                path_el.set('Value', str(output_samples_dst / sub_path))
 
     def _save_project(self, tree: ET.ElementTree, als_file_path: Path) -> None:
         """Save the modified project as a .als file.
@@ -4788,7 +4862,11 @@ class AbletonService:
         try:
             # Create output folder if it doesn't exist
             als_file_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
+            # Copy template samples alongside the output .als so Ableton can find
+            # the click track instrument sounds on any machine.
+            self._copy_template_samples(tree, als_file_path)
+
             # Convert the modified XML tree to string WITH the XML declaration
             xml_string = ET.tostring(tree.getroot(), encoding='unicode')
             

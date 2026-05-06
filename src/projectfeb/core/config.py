@@ -122,6 +122,9 @@ class Config:
             logger.warning(f"Config file not found at {config_path}, using defaults")
             self._load_from_env()
 
+        # Always resolve the bundled template — users never configure this.
+        self._resolve_bundled_template()
+
     def _load_from_file(self, config_path: Path) -> None:
         """Load configuration from JSON file."""
         try:
@@ -164,6 +167,25 @@ class Config:
         # Ableton
         self.ableton.template_path = os.getenv('ABLETON_TEMPLATE', '')
         self.ableton.output_folder = os.getenv('ABLETON_OUTPUT', '')
+
+    def _resolve_bundled_template(self) -> None:
+        """Always point template_path at the copy bundled with the app.
+
+        Works in three contexts:
+          - Frozen .app  : sys._MEIPASS / template / riderBaseTemplate.als
+          - Dev (source) : project root / template / riderBaseTemplate.als
+          - CI / testing : RIDER_BUNDLE_DIR env var overrides root
+        """
+        bundle_dir = os.environ.get('RIDER_BUNDLE_DIR')
+        if bundle_dir:
+            root = Path(bundle_dir)
+        else:
+            # Fall back to project root (4 levels up from this file)
+            root = Path(__file__).parent.parent.parent.parent
+
+        bundled = root / 'template' / 'riderBaseTemplate.als'
+        self.ableton.template_path = str(bundled)
+        logger.debug(f"Template resolved to bundled path: {bundled}")
 
     def save(self, config_path: Optional[Path] = None) -> None:
         """Save current configuration to file."""
