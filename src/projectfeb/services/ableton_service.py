@@ -4601,7 +4601,16 @@ class AbletonService:
         )
         if section_timings is None:
             template_intro_duration = self.TEMPLATE_ARRANGEMENT_INTRO_BEATS
+            # Use guide WAV duration (in beats) when available so sections span
+            # the actual song rather than a hardcoded 240-beat estimate.
             available_song_duration = 240 - template_intro_duration
+            if guide_wav is not None and bpm > 0:
+                _, _, _dur_sec = self._get_wav_metadata(guide_wav.path)
+                if _dur_sec > 0:
+                    available_song_duration = max(
+                        available_song_duration,
+                        (_dur_sec * bpm / 60.0) - template_intro_duration,
+                    )
             beats_per_section = available_song_duration / num_sections if num_sections > 0 else available_song_duration
             section_timings = [
                 {
@@ -4616,7 +4625,7 @@ class AbletonService:
             logger.info(
                 f"  Song starts at beat {beat_position}, arrangement sections start at beat {beat_position + template_intro_duration}"
             )
-            logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration} available beats")
+            logger.info(f"  {beats_per_section:.1f} beats per section across {available_song_duration:.1f} available beats")
         else:
             logger.info(f"Adding {len(section_timings)} guide-aligned MIDI clips for '{song.title}'")
         
@@ -4825,14 +4834,22 @@ class AbletonService:
             if not rel_val.startswith('Samples/'):
                 continue
 
-            # Ensure HasRelativePath is present and true so Ableton uses it
-            has_rel_el = fileref.find('HasRelativePath')
-            if has_rel_el is None:
-                has_rel_el = ET.Element('HasRelativePath')
-                fileref.insert(0, has_rel_el)
-            has_rel_el.set('Value', 'true')
+            # Switch to absolute mode so Ableton uses Path directly.
+            # RelativePathType="3" (project-relative) requires an "Ableton Project Info/"
+            # folder to resolve — without it Ableton marks files missing even when the
+            # absolute Path is correct.  Setting RelativePathType="0" makes Ableton use
+            # the Path element unconditionally, which we rewrite to the copied location.
+            rel_type_el = fileref.find('RelativePathType')
+            if rel_type_el is not None:
+                rel_type_el.set('Value', '0')
 
-            # Rewrite absolute path using the relative path value (works from any source machine)
+            # If a HasRelativePath element is present (e.g., from a previous run), disable it
+            # so Ableton does not attempt relative-path resolution.
+            has_rel_el = fileref.find('HasRelativePath')
+            if has_rel_el is not None:
+                has_rel_el.set('Value', 'false')
+
+            # Rewrite absolute path to the copied Samples location
             if path_el is not None:
                 sub_path = rel_val[len('Samples/'):]
                 path_el.set('Value', str(output_samples_dst / sub_path))

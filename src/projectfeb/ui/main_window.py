@@ -253,13 +253,16 @@ class ProjectFEBApp:
         self.loading_status_pulse_on = False
         self.suppress_selection_callbacks = False
         self.pending_ui_callbacks: queue.Queue[Callable[[], None]] = queue.Queue()
-        self.assets_path = Path(__file__).parent.parent.parent.parent / "img"
-        self.fonts_path = Path(__file__).parent.parent.parent.parent / "font"
+        import os as _os
+        _bundle_dir = _os.environ.get('RIDER_BUNDLE_DIR')
+        _root = Path(_bundle_dir) if _bundle_dir else Path(__file__).parent.parent.parent.parent
+        self.assets_path = _root / "img"
+        self.fonts_path = _root / "font"
         self.app_icon_image: Optional[ImageTk.PhotoImage] = None
         self.brand_logo_image: Optional[ctk.CTkImage] = None
 
         # Preferences file
-        self.preferences_path = Path(__file__).parent.parent.parent.parent / "config" / "preferences.json"
+        self.preferences_path = _root / "config" / "preferences.json"
         self.preferences = self._load_preferences()
         self.multitracks_service.set_stem_type_overrides(self._stem_type_override_preferences())
 
