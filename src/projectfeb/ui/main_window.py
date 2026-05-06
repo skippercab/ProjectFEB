@@ -253,13 +253,16 @@ class ProjectFEBApp:
         self.loading_status_pulse_on = False
         self.suppress_selection_callbacks = False
         self.pending_ui_callbacks: queue.Queue[Callable[[], None]] = queue.Queue()
-        self.assets_path = Path(__file__).parent.parent.parent.parent / "img"
-        self.fonts_path = Path(__file__).parent.parent.parent.parent / "font"
+        import os as _os
+        _bundle_dir = _os.environ.get('RIDER_BUNDLE_DIR')
+        _root = Path(_bundle_dir) if _bundle_dir else Path(__file__).parent.parent.parent.parent
+        self.assets_path = _root / "img"
+        self.fonts_path = _root / "font"
         self.app_icon_image: Optional[ImageTk.PhotoImage] = None
         self.brand_logo_image: Optional[ctk.CTkImage] = None
 
         # Preferences file
-        self.preferences_path = Path(__file__).parent.parent.parent.parent / "config" / "preferences.json"
+        self.preferences_path = _root / "config" / "preferences.json"
         self.preferences = self._load_preferences()
         self.multitracks_service.set_stem_type_overrides(self._stem_type_override_preferences())
 
@@ -1352,13 +1355,6 @@ class SettingsDialog:
         # Ableton Section
         ab_frame = self._create_section(main_frame, "Ableton Live")
         
-        self.template_path_entry = self._create_file_field(
-            ab_frame,
-            "Template Path:",
-            self.config.ableton.template_path,
-            is_directory=False
-        )
-        
         self.output_folder_entry = self._create_file_field(
             ab_frame,
             "Output Folder:",
@@ -1782,7 +1778,6 @@ class SettingsDialog:
             self.config.planning_center.application_id = self.pco_app_id_entry.get().strip()
             self.config.planning_center.secret = self.pco_secret_entry.get().strip()
             self.config.multitracks.stems_folder = self.stems_folder_entry.get().strip()
-            self.config.ableton.template_path = self.template_path_entry.get().strip()
             self.config.ableton.output_folder = self.output_folder_entry.get().strip()
             self.config.ableton.output_buses = output_buses
             self.config.ableton.enable_sub_master = bool(self.sub_master_switch.get())
@@ -1807,13 +1802,6 @@ class SettingsDialog:
                 messagebox.showwarning(
                     "Validation Error",
                     "Multitracks stems folder does not exist."
-                )
-                return
-            
-            if self.config.ableton.template_path and not Path(self.config.ableton.template_path).exists():
-                messagebox.showwarning(
-                    "Validation Error",
-                    "Ableton template file does not exist."
                 )
                 return
             
