@@ -4780,6 +4780,48 @@ class AbletonService:
                 return regen_path
             regen_index += 1
 
+    def _copy_template_samples(self, tree: ET.ElementTree, als_file_path: Path) -> None:
+        """Copy template Samples/ folder alongside the output .als and fix absolute paths.
+
+        Ableton resolves samples via RelativePath first (relative to the .als file).
+        The template stores RelativePath as e.g. 'Samples/Processed/Freeze/Blip-4ths-1-1-2.wav'.
+        We copy the whole Samples/ tree from the template directory to the output directory
+        so Ableton can find them on any machine.  We also rewrite the absolute <Path> values
+        to point at the copied location so Ableton's fallback path also works.
+        """
+        template_samples_src = Path(self.template_path).parent / 'Samples'
+        if not template_samples_src.exists():
+            logger.warning(f"Template Samples folder not found at {template_samples_src}; skipping copy")
+            return
+
+        output_samples_dst = als_file_path.parent / 'Samples'
+        try:
+            import shutil
+            # Copy entire Samples tree, merging if it already exists
+            for src_file in template_samples_src.rglob('*'):
+                if not src_file.is_file():
+                    continue
+                relative = src_file.relative_to(template_samples_src)
+                dst_file = output_samples_dst / relative
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                if not dst_file.exists():
+                    shutil.copy2(src_file, dst_file)
+
+            logger.info(f"Template samples copied to {output_samples_dst}")
+        except Exception as e:
+            logger.error(f"Failed to copy template samples: {e}")
+            return
+
+        # Rewrite absolute <Path> values that point into the template Samples dir
+        old_prefix = str(template_samples_src)
+        new_prefix = str(output_samples_dst)
+        for fileref in tree.getroot().iter('FileRef'):
+            path_el = fileref.find('Path')
+            if path_el is not None:
+                val = path_el.get('Value', '')
+                if val.startswith(old_prefix):
+                    path_el.set('Value', new_prefix + val[len(old_prefix):])
+
     def _save_project(self, tree: ET.ElementTree, als_file_path: Path) -> None:
         """Save the modified project as a .als file.
         
@@ -4788,7 +4830,11 @@ class AbletonService:
         try:
             # Create output folder if it doesn't exist
             als_file_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
+            # Copy template samples alongside the output .als so Ableton can find
+            # the click track instrument sounds on any machine.
+            self._copy_template_samples(tree, als_file_path)
+
             # Convert the modified XML tree to string WITH the XML declaration
             xml_string = ET.tostring(tree.getroot(), encoding='unicode')
             
