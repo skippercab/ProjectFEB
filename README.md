@@ -42,8 +42,8 @@ When Rider opens for the first time it will ask you to configure a few things. Y
 
 Rider needs read access to your Planning Center account.
 
-1. Go to [api.planningcenteronline.com/oauth/applications](https://api.planningcenteronline.com/oauth/applications) and sign in.
-2. Create a new **Personal Access Token** application.
+1. Go to [api.planningcenteronline.com/personal_access_tokens](https://api.planningcenteronline.com/personal_access_tokens) and sign in.
+2. Create a new **Personal Access Token** in the upper right corner.
 3. Copy the **Application ID** and **Secret** into Rider's Settings screen.
 
 ### Multitracks stems folder
